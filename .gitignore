@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# backups / temp
+*.bak
+*.bak-*
+*.tmp
+
+# runtime state
+usage.json
+
+# OS
+.DS_Store

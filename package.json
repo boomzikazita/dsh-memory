@@ -1,0 +1,30 @@
+{
+  "name": "dsh-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "Persistent memory system for DeepSeek Harness: RRF multi-channel recall, confirmed writes, Fernet-encrypted vault, session transcription, and maintenance tooling.",
+  "license": "MIT",
+  "author": "boomzikazita",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boomzikazita/dsh-memory.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "rrf",
+    "recall"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.6"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

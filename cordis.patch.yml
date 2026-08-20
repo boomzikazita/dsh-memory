@@ -1,0 +1,6 @@
+# dsh-memory bundle patch — 记忆插件挂载（惰性声明；实际挂载见 web profile cordis.patch.yml 的绝对路径 insert）
+- insert:
+    - id: dsh-memory
+      name: 'dsh-memory'
+      config:
+        memoryDir: '~/.dsh/memories'
