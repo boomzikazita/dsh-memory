@@ -79,7 +79,7 @@ def fts_tokenizer(con) -> str | None:
     """探针：确认 session_chunks 虚表分词器。
 
     FTS5 config 表不记录 tokenizer（只有 version），须读 sqlite_master 的
-    CREATE VIRTUAL TABLE SQL 判断。非 trigram → 触发重建（legacy 式启动探针）。
+    CREATE VIRTUAL TABLE SQL 判断。非 trigram → 触发重建（hermes 式启动探针）。
     """
     try:
         row = con.execute("SELECT sql FROM sqlite_master WHERE name='session_chunks'").fetchone()
@@ -93,7 +93,7 @@ def fts_tokenizer(con) -> str | None:
 def rebuild_fts(con, state: dict) -> dict:
     """分词器不符（非 trigram）→ 重建：DROP + 新 schema + 清空 state 全量重转录。
 
-    2026-08-19 借鉴 legacy system：默认 unicode61 把连续中文当巨型 token（「茅台」匹配不到
+    2026-08-19 借鉴 hermes：默认 unicode61 把连续中文当巨型 token（「茅台」匹配不到
     「贵州茅台酒」），trigram 以 3-字符子串建索引，中文二元检索实质恢复。
     """
     con.execute("DROP TABLE IF EXISTS session_chunks")
@@ -111,14 +111,16 @@ def index_once() -> int:
     # provenance：来源可证（origin class + session kind + observed_at），与正文分开存
     con.execute(CHUNK_META_SCHEMA)
     state = load_state()
-    # FTS5 启动探针（借鉴 legacy system 的 FTS5 CJK 探针方案）：分词器不符即重建
+    # FTS5 启动探针（借鉴 hermes load_fts5_cjk_extension + 读探针）：分词器不符即重建
     if fts_tokenizer(con) != "trigram":
         state = rebuild_fts(con, state)
     added = 0
     for ws, sess, log in iter_session_files():
-        # 回合类型门控（§8.7）：cron/自动化会话不产生可晋升记忆候选
-        if sess.startswith("dsh-automation-session-"):
-            continue
+        # 会话种类门控（2026-08-21 修正，借鉴 OpenClaw memory-architecture）：
+        # 自动化/子代理会话的转录【照常进 L2 检索层】——任务产物可被检索（有用产物留门），
+        # 但 session_kind 标记为 automation，提案/升权侧据此排除【自动】提升（防脚手架噪音）。
+        # 产物升权只走显式通道：用户 memory_suggest 确认，或"跨会话被多次召回"的复用证据。
+        session_kind = "automation" if sess.startswith("dsh-automation-session-") else "interactive"
         key = f"{ws}/{sess}"
         last_seq = state.get(key, 0)
         raw = unzstd(log)
@@ -159,16 +161,15 @@ def index_once() -> int:
             last_rowid = cur.fetchone()[0]
             for i, (_, _, seq, origin) in enumerate(chunks):
                 cur.execute("INSERT INTO chunk_meta(rowid, origin, session_kind, observed_at) VALUES (?,?,?,?)",
-                            (last_rowid - (len(chunks) - 1 - i), origin, "interactive",
+                            (last_rowid - (len(chunks) - 1 - i), origin, session_kind,
                              datetime.datetime.now().isoformat()))
             state[key] = max(c[2] for c in chunks)
             added += len(chunks)
             # turn/end 钩子补 daily 追加（设计缺口修复）：转录即留痕，程序自动标时间戳
-            daily_append(f"会话转录 {sess} +{len(chunks)} 条（L2 索引）")
+            daily_append(f"会话转录 {sess} +{len(chunks)} 条（L2 索引，{session_kind}）")
     con.commit()
     con.close()
     save_state(state)
-    return added
     return added
 
 

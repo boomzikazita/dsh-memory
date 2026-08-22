@@ -33,13 +33,12 @@ SESSIONS_ROOT = HOME / ".dsh" / "sessions"
 L1_FILES = [MEMORIES / "MEMORY.md", MEMORIES / "USER.md"]
 L2_DB = MEMORIES / "index.sqlite"
 HITS_DB = MEMORIES / "hits.sqlite"
-# wiki 根（raw 目录；可用环境变量 DSH_WIKI_ROOT 覆盖，默认 ~/wiki/raw）
-WIKI_ROOT = pathlib.Path(os.environ.get("DSH_WIKI_ROOT", str(HOME / "wiki" / "raw")))
+WIKI_ROOT = HOME / "Nutstore Files" / "我的坚果云" / "wiki" / "raw"
 K = 60
 
-# 实体表（沿用 legacy system rrf_fuser.py，中文用 in 操作符；占位示例，按部署环境替换）
-_KNOWN_PERSONS = frozenset({"张三", "李四", "王五", "赵六", "钱七", "孙八", "alice"})
-_KNOWN_PROJECTS = frozenset({"RRF", "Mem0", "Letta", "Memory-OS", "DSH", "OpenClaw"})
+# 实体表（沿用 hermes rrf_fuser.py，中文用 in 操作符；新增人物/领域词按维护规格补充）
+_KNOWN_PERSONS = frozenset({"老郑", "郑鑫燚", "陈丹", "句号", "藏妤", "刘兰", "何启敏", "sophia", "张盈盈"})
+_KNOWN_PROJECTS = frozenset({"HMS", "Shadow-Weave", "RRF", "Hermes", "Mem0", "Letta", "Memory-OS", "DSH", "OpenClaw"})
 _KNOWN_TOPICS = frozenset({"A股", "情感", "控制论", "会议纪要", "Vaultwarden", "Honcho", "零信任", "RDP",
                            "ZeroTier", "飞书", "公文", "SiYuan", "Obsidian", "graphify", "skill", "cron"})
 
@@ -82,10 +81,15 @@ def bigrams(s: str) -> set:
 
 
 def lane1(query: str, q_entities: set) -> list:
-    """L1 关键词匹配：实体命中权重高，字符 bigram 重叠兜底（中文无需 \b）"""
+    """L1 关键词匹配：实体命中权重高，字符 bigram 重叠兜底（中文无需 \b）。
+
+    2026-08-22 加入时间衰减：score × decay_factor（常驻标签不衰减；
+    近期用过/新条目权重高，久未用/旧条目降权）。仅影响排序，不删条目。
+    """
     qb = bigrams(query)
     scored = []
     hits = []
+    usage = _load_usage()
     for ent in load_l1():
         score = 0.0
         ent_set = set(ent["entities"])
@@ -100,7 +104,8 @@ def lane1(query: str, q_entities: set) -> list:
             if tag in query:
                 score += 2.0
         if score >= 1.0:
-            scored.append((round(score, 2), f"[{ent['file']}] {ent['text']}"))
+            decay = decay_factor(ent["text"], ent["tags"], ent["file"], usage)
+            scored.append((round(score * decay, 2), f"[{ent['file']}] {ent['text']}"))
             hits.append((ent["file"], ent["text"][:40]))
     scored.sort(key=lambda x: -x[0])
     _record_usage(hits)
@@ -132,10 +137,66 @@ def _record_usage(hits: list) -> None:
         pass  # usage 统计失败不影响召回主链路
 
 
+# ---------- 时间衰减（借鉴论文 Rethinking Memory 4.1.5 forgetting & retention） ----------
+# 常驻标签：规则/安全/边界/身份/红线类条目永不衰减（稳定性优先）
+_PERSISTENT_TAGS = frozenset({"安全", "规则", "边界", "红线", "身份", "硬约束", "常驻"})
+# 衰减档位：(年龄上限天, 系数)。30 天内 1.0 → 90 天 0.7 → 180 天 0.5 → 更久 0.3
+_DECAY_TIERS = ((30, 1.0), (90, 0.7), (180, 0.5), (float("inf"), 0.3))
+
+
+def _load_usage() -> dict:
+    """读取 .usage.json（L1 条目 last_use/uses 统计）"""
+    try:
+        p = MEMORIES / ".usage.json"
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+                return data["entries"]
+    except Exception:
+        pass
+    return {}
+
+
+def _entry_version_date(text: str):
+    """L1 条目 <!-- v: YYYY-MM-DD --> 版本时间戳（无 usage 时的衰减 fallback）"""
+    m = re.search(r"<!--\s*v:\s*(\d{4}-\d{2}-\d{2})\s*-->", text)
+    if m:
+        try:
+            return datetime.date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def decay_factor(text: str, tags: list, fname: str, usage: dict | None = None) -> float:
+    """时间衰减系数（0.3~1.0）：
+    - 常驻标签（#安全/#规则/#边界/#红线/#身份/#硬约束/#常驻）→ 1.0 永不衰减
+    - 衰减基准 = 条目 <!-- v: --> 版本时间戳（知识确立/最后更新的老化信号）
+    - 无 v: → 文件 mtime（兜底）；无时间信息 → 1.0 不衰减（宁留不误伤）
+    - ⚠️ 不用 usage.last_use 作基准：命中即刷新会掩盖老化，导致衰减永不生效
+      （2026-08-22 实测：一次召回把所有条目 last_use 刷成当天，全 1.0）
+    """
+    if any(t in _PERSISTENT_TAGS for t in tags):
+        return 1.0
+    ref = _entry_version_date(text)
+    if ref is None:
+        # 无 v: 用文件 mtime（L1 文件整体改动时间，粗粒度但可用）
+        try:
+            mt = datetime.date.fromtimestamp((MEMORIES / fname).stat().st_mtime)
+        except Exception:
+            return 1.0
+        ref = mt
+    age = (datetime.date.today() - ref).days
+    for limit, coef in _DECAY_TIERS:
+        if age <= limit:
+            return coef
+    return 0.3
+
+
 def lane2(query: str) -> list:
     """L2 会话 FTS5（index.sqlite 由 harvest.py 建立；未建降级空）
 
-    trigram 分词器适配（2026-08-19 迁移，借鉴 legacy system 中文检索方案）：
+    trigram 分词器适配（2026-08-19 迁移，借鉴 hermes 中文检索方案）：
       - ≥3 字符 token 走 FTS MATCH（双引号包裹，规避 FTS5 语法特殊字符）
       - <3 字符 token（如「A股」）trigram 不建索引 → LIKE 降级扫描
     """
@@ -184,9 +245,8 @@ def lane3(l3_file: str | None) -> list:
 
 
 # ---------- L3 MCP 直连（honcho-codex-bridge，streamable-http） ----------
-# 未配置 DSH_HONCHO_MCP_URL 时 L3 静默降级（可选层）
-MCP_URL = os.environ.get("DSH_HONCHO_MCP_URL", "")
-MCP_TOKEN = os.environ.get("DSH_HONCHO_MCP_TOKEN", "")
+MCP_URL = os.environ.get("DSH_HONCHO_MCP_URL", "http://10.173.48.28:8001/mcp")
+MCP_TOKEN = os.environ.get("DSH_HONCHO_MCP_TOKEN", "honcho-codex-2026")
 
 
 def _mcp_rpc(method: str, params: dict, session_id: str | None = None):
@@ -221,8 +281,6 @@ def _mcp_sse_text(data: str) -> list:
 
 def lane3_mcp(query: str) -> list:
     """L3 语义召回：经 MCP 调用 honcho_search；桥不可达则静默降级（L3 为可选层）"""
-    if not MCP_URL:
-        return []
     try:
         sid, _init = _mcp_rpc("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
@@ -296,7 +354,8 @@ def lane5(date: datetime.date | None, limit: int = 40) -> list:
     """L5 时间窗召回：扫描 DSH 会话 JSONL 原文，按消息 time 字段过滤指定日期。
 
     一手材料溯源：消息级时间戳（epoch ms），只取 user/assistant 文本消息；
-    自动化/子代理会话（dsh-automation-session-*）跳过（§8.7 回合门控）。
+    自动化/子代理会话（dsh-automation-session-*）不再跳过（2026-08-21 修正，
+    借鉴 OpenClaw memory-architecture：任务产物可被检索；自动提升排除在提案侧）。
     """
     if date is None or not SESSIONS_ROOT.exists():
         return []
@@ -315,7 +374,7 @@ def lane5(date: datetime.date | None, limit: int = 40) -> list:
         except Exception:
             continue
         for sess in sess_dirs:
-            if not sess.is_dir() or sess.name.startswith("dsh-automation-session-"):
+            if not sess.is_dir():
                 continue
             log = sess / "session.jsonl.zstd"
             if not log.exists():
@@ -457,7 +516,7 @@ CURATED_REL = WIKI_ROOT.parent / "_meta" / "relations.md"  # wiki/_meta/relation
 
 def _curated_edges():
     """解析 wiki/_meta/relations.md 关系边三元组（markdown 表格行）。
-    单元格可含注解/多实体（如 '张三/李四/王五'、'张三（主攻线）'）。"""
+    单元格可含注解/多实体（如 '句号/刘兰/藏妤/何启敏'、'老郑（主攻线）'）。"""
     if not CURATED_REL.exists():
         return []
     try:
@@ -535,13 +594,14 @@ def rrf_fuse(lists: list, weights: list | None = None) -> list:
     return [(key, round(score, 4), meta[key]) for key, score in ranked]
 
 
-# ---------- 记忆命中统计（借鉴 legacy system memory_hits：存了不用要有度量） ----------
-def record_hits(results: list, enabled: bool = True) -> None:
+# ---------- 记忆命中统计（借鉴 hermes memory_hits：存了不用要有度量） ----------
+def record_hits(results: list, enabled: bool = True, inject_chars: int = 0) -> None:
     """每次真实召回把命中条目计数落库（hits.sqlite）。
 
     key = 文本 sha1 前 16 位（内容即身份）；同文本跨会话累计 count。
     L1 命中以条目前缀为身份——memory_hit_audit.py 用前缀匹配反查「从未命中条目」。
     primer 高频注入调用传 enabled=False（--no-hits），避免刷屏污染统计。
+    inject_chars（2026-08-22）：本次实际注入字符数，供预算档位调优统计。
     """
     if not enabled or not results:
         return
@@ -549,14 +609,19 @@ def record_hits(results: list, enabled: bool = True) -> None:
         con = sqlite3.connect(HITS_DB)
         con.execute("""CREATE TABLE IF NOT EXISTS hits(
             lane TEXT, key TEXT, text TEXT, count INTEGER DEFAULT 1,
-            last_ts TEXT, PRIMARY KEY(lane, key))""")
+            last_ts TEXT, inject_chars INTEGER DEFAULT 0,
+            PRIMARY KEY(lane, key))""")
+        # 旧表迁移（2026-08-22）：已有 hits 表无 inject_chars 列 → ALTER 补列
+        cols = [d[1] for d in con.execute("PRAGMA table_info(hits)").fetchall()]
+        if "inject_chars" not in cols:
+            con.execute("ALTER TABLE hits ADD COLUMN inject_chars INTEGER DEFAULT 0")
         now = datetime.datetime.now().isoformat(timespec="seconds")
         for r in results:
             key = hashlib.sha1(r["text"].encode("utf-8")).hexdigest()[:16]
             con.execute(
-                "INSERT INTO hits(lane, key, text, count, last_ts) VALUES(?,?,?,1,?) "
-                "ON CONFLICT(lane, key) DO UPDATE SET count = count + 1, last_ts = excluded.last_ts",
-                (r["source"], key, r["text"][:200], now),
+                "INSERT INTO hits(lane, key, text, count, last_ts, inject_chars) VALUES(?,?,?,1,?,?) "
+                "ON CONFLICT(lane, key) DO UPDATE SET count = count + 1, last_ts = excluded.last_ts, inject_chars = excluded.inject_chars",
+                (r["source"], key, r["text"][:200], now, inject_chars),
             )
         con.commit()
         con.close()
@@ -564,7 +629,7 @@ def record_hits(results: list, enabled: bool = True) -> None:
         pass  # 命中统计失败不影响召回主链路
 
 
-# ---------- 事实速查卡注入（借鉴 legacy system fidelity-primer：定型卡片优先于模糊召回） ----------
+# ---------- 事实速查卡注入（借鉴 hermes fidelity-primer：定型卡片优先于模糊召回） ----------
 FIDELITY_CARD_FILE = WIKI_ROOT.parent / "raw" / "技术" / "系统运维" / "错误事项清单-dsh.md"
 
 
@@ -688,7 +753,7 @@ def main() -> None:
         results.append({"source": lane_name, "score": score, "trust": trust, "text": snippet})
 
     # 记忆命中统计（② memory_hits）：真实召回落库，primer 注入不记录
-    record_hits(results, enabled=not args.no_hits)
+    record_hits(results, enabled=not args.no_hits, inject_chars=used)
 
     if args.json:
         print(json.dumps({"query": args.query, "entities": sorted(q_entities),

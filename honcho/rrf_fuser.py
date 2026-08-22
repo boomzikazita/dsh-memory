@@ -2,7 +2,7 @@
 RRF Fusion Layer for Honcho Memory Provider
 ============================================
 Implements four-way RRF multi-recall fusion + entity graph + evidence ledger
-as described in the layered memory architecture.
+as described in the HMS architecture.
 
 Sources:
   L1: MEMORY.md / USER.md keyword matching (curated facts) + reference following
@@ -16,7 +16,6 @@ Usage:
 """
 
 import re
-import os
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
@@ -24,13 +23,13 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 
 # ---------------------------------------------------------------------------
-# Paths (dsh 版，2026-08-19 解耦：由 legacy system 迁移，指向 dsh 记忆库)
+# Paths (dsh 版，2026-08-19 解耦：由 hermes 迁移，指向 dsh 记忆库)
 # ---------------------------------------------------------------------------
-def _dsh_home() -> Path:
+def _hermes_home() -> Path:
     return Path.home() / '.dsh'
 
 def _wiki_root() -> Path:
-    return Path(os.environ.get('DSH_WIKI_ROOT', str(Path.home() / 'wiki')))
+    return Path.home() / 'Nutstore Files' / '我的坚果云' / 'wiki'
 
 def _memory_dir() -> Path:
     return Path.home() / '.dsh' / 'memories'
@@ -38,8 +37,8 @@ def _memory_dir() -> Path:
 # ---------------------------------------------------------------------------
 # Hard-coded entity lists (extend as needed)
 # ---------------------------------------------------------------------------
-_KNOWN_PERSONS = frozenset({'张三', '李四', '王五', '赵六', '钱七', '孙八', 'alice'})
-_KNOWN_PROJECTS = frozenset({'RRF', 'Mem0', 'Letta', 'Memory-OS', 'DSH', 'OpenClaw'})
+_KNOWN_PERSONS = frozenset({'老郑', '陈丹', '句号', '藏妤', '刘兰', '何启敏', 'sophia'})
+_KNOWN_PROJECTS = frozenset({'HMS', 'Shadow-Weave', 'RRF', 'Hermes', 'Mem0', 'Letta', 'Memory-OS'})
 _KNOWN_TOPICS = frozenset({'A股', '情感', '控制论', '会议纪要', 'Vaultwarden', 'Honcho', '零信任', 'RDP', 'ZeroTier'})
 
 _ALL_ENTITIES = {
@@ -144,7 +143,7 @@ def _l1_keyword_match(query: str, top_k: int = 10) -> List[str]:
     """Keyword match against MEMORY.md / USER.md entries.
 
     Scores by occurrence count: primary terms weigh 3x, 2-grams weigh 1x.
-    This keeps entity-heavy entries (e.g. 张三) above generic noise (最近).
+    This keeps entity-heavy entries (e.g. 陈丹) above generic noise (最近).
     """
     primaries, grams = _tokenize(query)
     # Inject known entity names (e.g. 'A股' survives mixed-token queries)

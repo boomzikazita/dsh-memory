@@ -1,5 +1,5 @@
 /**
- * dsh-memory — DSH persistent memory plugin (layered memory architecture → DSH)
+ * dsh-memory — DSH 专属记忆插件（HMS 架构 → DSH 实现）
  *
  * 分层：L1 规则(MEMORY/USER) / L2 会话 FTS5 / L3 语义(可选 MCP) / L4 wiki 活指针
  *       + RRF 四路融合 + 确认制写入 + Fernet 加密库 + 维护自动化工具
@@ -41,7 +41,7 @@ const WRITE_TOOLS = new Set(['write', 'edit', 'memory_suggest', 'memory_vault_se
 // primer 门控：实体/主题关键词（命中才召回注入；默认零注入）
 const PRIMER_GATE = [
   '记忆', '记住', '忘了', '偏好', '人物', '档案', '端口', '配置', '会议纪要',
-  'A股', '控制论', 'Honcho', 'ZeroTier', '飞书', 'Vaultwarden', '张三', '李四',
+  'A股', '控制论', 'Honcho', 'ZeroTier', '飞书', 'Vaultwarden', '老郑', '句号',
 ]
 
 /** 从消息 content（字符串或块数组）提取纯文本 */
@@ -98,8 +98,6 @@ export function apply(ctx, config = {}) {
   }
   const memoryDir = expandHome(config.memoryDir) || DEFAULT_MEMORY_DIR
   const scriptsDir = expandHome(config.scriptsDir) || SCRIPTS_DIR
-  // wiki 根（可配置：config.wikiRoot 或环境变量 DSH_WIKI_ROOT；默认 ~/wiki）
-  const wikiRoot = expandHome(config.wikiRoot) || process.env.DSH_WIKI_ROOT || join(HOME, 'wiki')
   const budgets = { MEMORY: Number(config.budgetMemory ?? 4400), USER: Number(config.budgetUser ?? 2750) }
   const guardBlock = config.guardBlock === true
   const primerBudget = Number(config.primerBudget ?? 800)
@@ -125,6 +123,60 @@ export function apply(ctx, config = {}) {
   const budgetFor = (track) => (track === 'user' ? budgets.USER : budgets.MEMORY)
   const targetFor = (track) => (track === 'user' ? 'USER.md' : 'MEMORY.md')
 
+  // ---------- 同主题重叠检测（2026-08-22，借鉴论文 Rethinking Memory 4.2.3 选择性写入） ----------
+  // 目标：memory_suggest 提交时提示与既有 L1 条目 / pending 提案的重叠，推动合并而非盲追加。
+  // 度量：bigram 字符重叠率（中文核心）+ #标签交集；≥阈值判"重叠候选"。
+  function bigramsOf(text) {
+    const s = text.replace(/#[\u4e00-\u9fffA-Za-z0-9_-]+/g, ' ').replace(/<!--.*?-->/g, ' ')
+    const grams = new Set()
+    for (let i = 0; i < s.length - 1; i++) {
+      const g = s.slice(i, i + 2)
+      if (/[\u4e00-\u9fff]/.test(g) || /[A-Za-z0-9]/.test(g[0]) && /[A-Za-z0-9]/.test(g[1])) grams.add(g)
+    }
+    return grams
+  }
+  function overlapOf(a, b) {
+    const ga = bigramsOf(a), gb = bigramsOf(b)
+    if (!ga.size || !gb.size) return 0
+    let hit = 0
+    for (const g of ga) if (gb.has(g)) hit++
+    return hit / Math.min(ga.size, gb.size)
+  }
+  function tagsOf(text) {
+    return new Set([...text.matchAll(/#([\u4e00-\u9fffA-Za-z0-9_-]+)/g)].map((m) => m[1]))
+  }
+  /** 返回与 content 重叠的既有条目/提案：{kind, head, overlap, tags} 列表（按重叠度降序，≤3） */
+  function findOverlaps(content) {
+    const out = []
+    const cTags = tagsOf(content)
+    // ① 既有 L1（MEMORY.md / USER.md，§ 分隔）
+    for (const name of ['MEMORY.md', 'USER.md']) {
+      const raw = read(name)
+      if (!raw.trim()) continue
+      for (const ent of raw.split('§')) {
+        const e = ent.trim()
+        if (!e || e.length < 10) continue
+        const ov = overlapOf(content, e)
+        const eTags = tagsOf(e)
+        let tagHit = 0
+        for (const t of cTags) if (eTags.has(t)) tagHit++
+        if (ov >= 0.35 || (ov >= 0.2 && tagHit >= 1)) {
+          out.push({ kind: `L1:${name}`, head: e.slice(0, 60), overlap: Math.round(ov * 100), tags: tagHit })
+        }
+      }
+    }
+    // ② pending 提案（同 track 未确认）
+    for (const s of loadSuggestions()) {
+      if (s.status !== 'pending') continue
+      const ov = overlapOf(content, s.content)
+      if (ov >= 0.35) {
+        out.push({ kind: 'pending', head: s.content.slice(0, 60), overlap: Math.round(ov * 100), tags: 0 })
+      }
+    }
+    out.sort((a, b) => b.overlap - a.overlap || b.tags - a.tags)
+    return out.slice(0, 3)
+  }
+
   function loadSuggestions() {
     const raw = read('SUGGESTIONS.jsonl')
     if (!raw.trim()) return []
@@ -137,7 +189,7 @@ export function apply(ctx, config = {}) {
   // ---------- 1. 工具：memory_recall ----------
   ctx.tools.register(defineTool({
     name: 'memory_recall',
-    description: '五路 RRF 记忆召回（L1 规则/L2 会话/L3 语义/L4 wiki/L5 时间窗），返回带来源标记的证据账本；用于跨会话事实、用户偏好、历史决策、人物档案查询。时间性查询（"昨天聊了什么"/"某天干了啥"）务必带 date 参数走 L5 一手材料溯源。deep=true 为深度召回（通道2 升级）：topk=8、预算=2000，用于时间性/多跳/结论依赖细节的问题',
+    description: '五路 RRF 记忆召回（L1 规则/L2 会话/L3 语义/L4 wiki/L5 时间窗），返回带来源标记的证据账本。时间性查询（"昨天聊了什么"）务必带 date 走 L5；deep=true 深度召回（topk=8/预算2000）用于多跳/结论依赖细节。',
     parameters: {
       query: { type: 'string', required: true, description: '召回查询（自然语言/关键词/实体名）' },
       budget: { type: 'number', description: '输出字符预算，默认 800（手术级注入档位：简单 400 / 常规 1200 / 深度 2000）' },
@@ -165,9 +217,9 @@ export function apply(ctx, config = {}) {
   // ---------- 1.5 工具：memory_graph（关系图谱沿边查询，resource 方案沿边数据源） ----------
   ctx.tools.register(defineTool({
     name: 'memory_graph',
-    description: '关系图谱沿边查询（双源）：curated 类型边（wiki/_meta/relations.md 手工三元组，带类型如 works_at/relates）+ 自动共现边（~/.dsh/data/relations.json，带权重+会话证据）。输入实体名或含实体的自然语言，返回该实体邻接关系；用于"谁和谁什么关系/参与过什么/和哪些主题连着"类查询与 resource 工具沿边导航。',
+    description: '关系图谱沿边查询（curated 类型边 + 自动共现边）。输入实体名或含实体的自然语言，返回邻接关系；用于"谁和谁什么关系/参与过什么"类查询。',
     parameters: {
-      query: { type: 'string', required: true, description: '实体名或含实体的自然语言（如 李四 / 张三参与过哪些项目）' },
+      query: { type: 'string', required: true, description: '实体名或含实体的自然语言（如 句号 / 老郑参与过哪些项目）' },
       min_w: { type: 'number', description: '自动共现边权重下限，默认 0（过滤弱边噪音用，如 4）' },
     },
     output: {
@@ -186,7 +238,7 @@ export function apply(ctx, config = {}) {
   // ---------- 2. 工具：memory_suggest（确认制写入提案） ----------
   ctx.tools.register(defineTool({
     name: 'memory_suggest',
-    description: '提交记忆写入提案（进待确认队列，不直接写）。track: memory=全局规则/USER=用户档案/skill=技能草案。lifecycle（2026-08-20 治理）：rule=常驻规则/stable=稳定偏好/situational=情境（自动带 expires，默认90天）/record=一次性完成记录（不建议进 L1，提示归 wiki）。敏感内容请用 memory_vault_set 而非本工具',
+    description: '提交记忆写入提案（进待确认队列，不直接写）。track: memory=全局规则/USER=用户档案/skill=技能草案。lifecycle: rule=常驻/stable=稳定/situational=情境（自动带 expires 默认90天）/record=一次性记录（不进 L1 归 wiki）。敏感内容用 memory_vault_set',
     parameters: {
       content: { type: 'string', required: true, description: '提案内容（§ 格式条目或技能草案）' },
       track: { type: 'string', description: 'memory / user / skill，默认 memory' },
@@ -233,8 +285,14 @@ export function apply(ctx, config = {}) {
       suggestions.push(item)
       saveSuggestions(suggestions)
       let warn = ''
-      if (lifecycle === 'record') warn = '（提示：record=完成记录，按治理规则应归 wiki 而非 L1，weekly-review 会提归档）'
-      if (lifecycle === 'situational') warn = `（情境类，expires=${expires}，到期 weekly-review 提归档）`
+      // 同主题重叠检测（2026-08-22）：提示与既有 L1 / pending 提案的合并候选，抑制记忆冗余
+      const overlaps = findOverlaps(content)
+      if (overlaps.length) {
+        const parts = overlaps.map((o) => `${o.kind}[${o.overlap}%${o.tags ? `,标签${o.tags}` : ''}]「${o.head}…」`)
+        warn = ` ⚠️ 与既有记忆重叠：${parts.join('；')}。建议采纳时合并/更新既有条目而非新增（L1 预算 ${current + extra}/${budget}）。`
+      }
+      if (lifecycle === 'record') warn += '（提示：record=完成记录，按治理规则应归 wiki 而非 L1，weekly-review 会提归档）'
+      if (lifecycle === 'situational') warn += `（情境类，expires=${expires}，到期 weekly-review 提归档）`
       return `[memory_suggest] 提案 ${item.id} 已入队（track=${track} lifecycle=${lifecycle}${expires ? ` expires=${expires}` : ''}，队列共 ${suggestions.length} 条）${warn}。待 memory_confirm 采纳。`
     },
   }))
@@ -300,7 +358,7 @@ export function apply(ctx, config = {}) {
   // ---------- 4. 工具：memory_vault_get / memory_vault_set（Fernet 加密库） ----------
   ctx.tools.register(defineTool({
     name: 'memory_vault_get',
-    description: '从加密库读取敏感条目（如 vault:person/李四）。结果标 SENSITIVE：只用于当前任务，禁止写入会话日志或明文记忆',
+    description: '从加密库读取敏感条目（如 vault:person/句号）。结果标 SENSITIVE：只用于当前任务，禁止写入会话日志或明文记忆',
     parameters: { ref: { type: 'string', required: true, description: 'vault 引用（vault:xxx 或 xxx）' } },
     output: { schema: { type: 'string', description: '条目内容' }, render: (args, value) => [{ type: 'text', text: value }] },
     async execute(input) {
@@ -314,7 +372,7 @@ export function apply(ctx, config = {}) {
     name: 'memory_vault_set',
     description: '写入加密库条目（敏感内容专用）。写入后明文只允许出现 → vault:<ref> 引用，禁止出现原文',
     parameters: {
-      ref: { type: 'string', required: true, description: '条目引用（如 person/李四、credential/vaultwarden）' },
+      ref: { type: 'string', required: true, description: '条目引用（如 person/句号、credential/vaultwarden）' },
       value: { type: 'string', required: true, description: '条目内容（敏感原文）' },
     },
     output: { schema: { type: 'string', description: '结果' }, render: (args, value) => [{ type: 'text', text: value }] },
@@ -366,11 +424,11 @@ export function apply(ctx, config = {}) {
         const rrfSrc = readFileSync(join(scriptsDir, 'rrf_recall.py'), 'utf8')
         // 实体表对账（2026-08-20 修正）：数量对比无意义（含项目/主题/别名），
         // 改为"人物差集"：_KNOWN_PERSONS 别名归一后，每个规范人物应有 entities/ 页
-        const alias = { alice: '张三' } // 示例别名映射（与 rrf_recall.py _KNOWN_PERSONS 对齐；按部署环境替换）
+        const alias = { sophia: '藏妤', 郑鑫燚: '老郑', 郑铭燚: '老郑' } // 与 light_graph.py PERSON_ALIASES 对齐
         const pBlock = rrfSrc.match(/_KNOWN_PERSONS = frozenset\(\{([\s\S]*?)\}\)/)
         const persons = [...(pBlock?.[1]?.match(/["'][^"']+["']/g) || [])].map((s) => s.replace(/["']/g, ''))
         const canonical = [...new Set(persons.map((p) => alias[p] ?? p))]
-        const entDir = join(wikiRoot, 'entities')
+        const entDir = join(HOME, 'Nutstore Files', '我的坚果云', 'wiki', 'entities')
         const entNames = existsSync(entDir) ? readdirSync(entDir).filter((f) => f.endsWith('.md')).map((f) => f.slice(0, -3)) : []
         const missing = canonical.filter((p) => !entNames.includes(p))
         const ok = canonical.length > 0 && missing.length === 0
@@ -426,7 +484,7 @@ export function apply(ctx, config = {}) {
     description: '向飞书聊天推送消息（周报/告警/提醒）。需要 LARK_APP_ID/LARK_APP_SECRET（环境变量或 ~/.env）与目标 chat_id；未配置时返回提示不报错',
     parameters: {
       text: { type: 'string', required: true, description: '推送内容' },
-      chatId: { type: 'string', description: '目标 chat_id，默认取环境变量 LARK_DEFAULT_CHAT 或配置（未配置时返回提示）' },
+      chatId: { type: 'string', description: '目标 chat_id，默认 oc_e6a44a01ec13fe6d94246fbb8df153af（hermes 时代主会话，唯一已验证推送通道）' },
     },
     output: { schema: { type: 'string', description: '推送结果' }, render: (args, value) => [{ type: 'text', text: value }] },
     async execute(input) {
@@ -476,7 +534,7 @@ export function apply(ctx, config = {}) {
           if (gated) {
             const budget = classifyBudget(text) // 手术级注入分档（§8.5）
             const q = text.slice(0, 200)
-            // fidelity-primer（借鉴 legacy system）：先试定型速查卡，无卡自动降级 RRF；
+            // fidelity-primer（借鉴 hermes）：先试定型速查卡，无卡自动降级 RRF；
             // --no-hits：primer 高频注入不污染命中统计
             const pc = py('rrf_recall.py', [q, '--primers', '--no-hits'])
             if (pc.ok && pc.out.startsWith('# 速查卡')) {

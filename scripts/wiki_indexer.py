@@ -13,14 +13,13 @@ L1 预算有限放不下全部指针，且 wiki/index.md 只收录 33/528 页—
   wiki_indexer.py update    增量更新（mtime 变化）
   wiki_indexer.py check     索引状态与覆盖统计
 """
-import os
 import re
 import sqlite3
 import sys
 from pathlib import Path
 
 HOME = Path.home()
-WIKI_ROOT = Path(os.environ.get("DSH_WIKI_ROOT", str(HOME / "wiki"))) / "raw"
+WIKI_ROOT = HOME / "Nutstore Files" / "我的坚果云" / "wiki" / "raw"
 DB_PATH = HOME / ".dsh" / "memories" / "wiki_index.sqlite"
 
 SCHEMA = """

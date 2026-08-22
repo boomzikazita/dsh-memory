@@ -6,9 +6,9 @@
   auto     ~/.dsh/data/relations.json —— 自动共现边（权重 + 会话证据，light_graph.py 生成）
 
 用法:
-  python3 graph_query.py "张三和李四"      # 自然语言自动提实体 → 沿边文本
-  python3 graph_query.py 张三 --json        # 结构化输出（供插件工具/resource 沿边消费）
-  python3 graph_query.py 张三 --min-w 5     # auto 边权重下限过滤（默认 0）
+  python3 graph_query.py "句号和藏妤"      # 自然语言自动提实体 → 沿边文本
+  python3 graph_query.py 句号 --json        # 结构化输出（供插件工具/resource 沿边消费）
+  python3 graph_query.py 句号 --min-w 5     # auto 边权重下限过滤（默认 0）
 
 这是 resource 工具方案（统一资源视图）的沿边数据源：
   resource ls mem://person/<实体>  ← 调本引擎拿邻接
@@ -23,7 +23,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import rrf_recall  # 复用实体表/提取（同一插件 scripts 目录）
 
 HOME = pathlib.Path.home()
-WIKI = pathlib.Path(os.environ.get("DSH_WIKI_ROOT", str(HOME / "wiki")))
+WIKI = HOME / "Nutstore Files" / "我的坚果云" / "wiki"
 CURATED = WIKI / "_meta" / "relations.md"
 AUTO = HOME / ".dsh" / "data" / "relations.json"
 KNOWN = [name for name, _ in rrf_recall._ALL_ENTITIES]

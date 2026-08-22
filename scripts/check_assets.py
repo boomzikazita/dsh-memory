@@ -69,7 +69,7 @@ for d in sorted(glob.glob(HOME + "/.dsh/plugins/*")):
         hits.append(("plugin", name, desc))
 
 # 4. 状态卡变更记录（最近 30 条，每条含日期+动作）
-card = os.environ.get("DSH_WIKI_ROOT", HOME + "/wiki") + "/raw/技术/系统运维/系统状态卡.md"
+card = HOME + "/Nutstore Files/我的坚果云/wiki/raw/技术/系统运维/系统状态卡.md"
 if os.path.exists(card):
     try:
         text = open(card, encoding="utf-8", errors="ignore").read()

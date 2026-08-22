@@ -6,7 +6,7 @@
   feishu_push.py --retry [limit]        补投所有 pending 条目（失败重投/崩溃恢复）
   feishu_push.py --status               查看 outbox 状态（pending/done 计数）
 
-outbox（2026-08-19 借鉴 legacy system delivery_obligations，投递「必达」）：
+outbox（2026-08-19 借鉴 hermes delivery_obligations，投递「必达」）：
   ~/.dsh/memories/outbox.jsonl —— 推送先入队落盘，成功才标记 done。
   fire-and-forget 的推送失败即丢失（A股日报等定时产物），outbox 让失败项
   留存，health 周检（dsh_health_report.py）扫 pending 自动补投。
@@ -17,7 +17,7 @@ outbox（2026-08-19 借鉴 legacy system delivery_obligations，投递「必达�
   3. ~/.dsh/.credentials.yaml（LARK_APP_SECRET）+ settings.yaml（appId）
 未配置时输出提示（非错误退出），由调用方决定是否降级。
 
-目标 chat 默认: 环境变量 LARK_DEFAULT_CHAT（未配置则为空，由调用方传入 chat_id）
+目标 chat 默认: oc_e6a44a01ec13fe6d94246fbb8df153af（hermes 时代沿用）
 
 [2026-08-18 修复] post() 捕获 HTTPError 并输出飞书错误体（code/msg）。
 [2026-08-19 新增] outbox 层：append→send→mark；--retry 补投；--status 查询。
@@ -31,7 +31,7 @@ import pathlib
 import urllib.request
 import urllib.error
 
-DEFAULT_CHAT = os.environ.get("LARK_DEFAULT_CHAT", "")  # 默认目标 chat_id（可经环境变量配置）
+DEFAULT_CHAT = "oc_e6a44a01ec13fe6d94246fbb8df153af"  # hermes 时代沿用主会话（唯一已验证推送通道）
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 OUTBOX = pathlib.Path.home() / ".dsh" / "memories" / "outbox.jsonl"
 

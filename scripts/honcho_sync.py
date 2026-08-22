@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """honcho_sync.py — dsh 会话 → Honcho L3 写入钩子（任务 A：Deriver 落地）
 
-背景：Honcho（L3 语义层）在 legacy system→dsh 迁移后无写入方，search 只剩旧数据。
+背景：Honcho（L3 语义层）在 hermes→dsh 迁移后无写入方，search 只剩 8/16 前旧数据。
 本脚本从 dsh 会话 JSONL 提取有信息量的 user 消息 → 批量写入 Honcho conclusions
-（observer=dsh-agent, observed=<user>），供 honcho_search/chat 召回。
+（observer=dsh-agent, observed=laozheng），供 honcho_search/chat 召回。
 
 用法：
   honcho_sync.py sync [--days N]   增量同步最近 N 天 user 消息（默认 2）
@@ -14,7 +14,6 @@
 """
 import argparse
 import json
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -26,7 +25,7 @@ import harvest  # 复用 unzstd / iter_session_files / extract_text_blocks
 HONCHO_BASE = "http://127.0.0.1:8000"
 WS = "dsh"
 OBSERVER = "dsh-agent"
-OBSERVED = os.environ.get("HONCHO_OBSERVED_ID", "user")
+OBSERVED = "laozheng"
 STATE_FILE = Path.home() / ".dsh" / "memories" / "honcho-sync-state.json"
 MIN_LEN = 15  # 过滤超短指令/单字回复
 MAX_MSG_PER_RUN = 50  # 单次上限，防止灌爆

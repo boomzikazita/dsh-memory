@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""memory_hit_audit.py — 记忆命中审计（借鉴 legacy system memory_hits：存了不用要有度量）
+"""memory_hit_audit.py — 记忆命中审计（借鉴 hermes memory_hits：存了不用要有度量）
 
 统计 rrf_recall.py record_hits 落库的 hits.sqlite，反查 L1 条目命中情况：
 

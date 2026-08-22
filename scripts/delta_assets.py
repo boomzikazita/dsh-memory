@@ -22,7 +22,7 @@ for d, typ in [(HOME + "/.dsh/scripts", "script"), (HOME + "/.dsh/skills", "skil
         except Exception:
             pass
 
-card = os.environ.get("DSH_WIKI_ROOT", HOME + "/wiki") + "/raw/技术/系统运维/系统状态卡.md"
+card = HOME + "/Nutstore Files/我的坚果云/wiki/raw/技术/系统运维/系统状态卡.md"
 if os.path.exists(card):
     try:
         text = open(card, encoding="utf-8", errors="ignore").read()
