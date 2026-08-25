@@ -33,6 +33,7 @@ SESSIONS_ROOT = HOME / ".dsh" / "sessions"
 L1_FILES = [MEMORIES / "MEMORY.md", MEMORIES / "USER.md"]
 L2_DB = MEMORIES / "index.sqlite"
 HITS_DB = MEMORIES / "hits.sqlite"
+CORRECTIONS_FILE = MEMORIES / "corrections.jsonl"
 WIKI_ROOT = HOME / "Nutstore Files" / "我的坚果云" / "wiki" / "raw"
 K = 60
 
@@ -232,6 +233,47 @@ def lane2(query: str) -> list:
         return []
 
 
+def load_corrected() -> list:
+    """加载 corrections.jsonl 中被纠正的 assistant 消息（corrected 字段）。
+
+    2026-08-23 补断环：纠正信号此前只写不读。此函数供 L2 召回对被纠正内容做
+    ⚠ 标注（确定性标记、不裁决）。旧条目无 corrected 字段 → 返回空列表（自然跳过）。
+    """
+    out = []
+    if not CORRECTIONS_FILE.exists():
+        return out
+    try:
+        for line in CORRECTIONS_FILE.open(encoding="utf-8"):
+            try:
+                r = json.loads(line)
+                c = r.get("corrected")
+                if c:
+                    out.append(c)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def is_corrected(text: str, corrected_list: list) -> bool:
+    """判断 L2 召回文本是否命中"被纠正过的内容"。
+
+    匹配：① 前缀匹配（同一 assistant 消息在 index 存 text[:2000]、corrected 存
+    text[:500]，两者同源截断、前缀一致）；② bigram 重叠兜底（防标点/空白差异）。
+    """
+    if not corrected_list or not text:
+        return False
+    tb = bigrams(text)
+    for c in corrected_list:
+        if text.startswith(c) or c.startswith(text):
+            return True
+        cb = bigrams(c)
+        if cb and len(tb & cb) / len(cb) > 0.6:
+            return True
+    return False
+
+
 def lane3(l3_file: str | None) -> list:
     """L3 语义：可选，由插件传入 Honcho/MCP 结果 [{text, score}]"""
     if not l3_file:
@@ -306,6 +348,19 @@ def _resolve_wiki(rel: str) -> list:
         except Exception:
             pass
     return out[:3]
+
+
+def _title_to_rel(title: str) -> str | None:
+    """wiki 标题 → rel_path（相对 WIKI_ROOT 的 posix 路径）。供 BFS 邻接节点显示。"""
+    if not WIKI_DB.exists():
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect(WIKI_DB)
+        row = con.execute("SELECT rel_path FROM wiki_docs WHERE title=?", (title,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 def _unzstd(path) -> str | None:
@@ -474,16 +529,96 @@ def _wiki_index_hits(query: str, limit: int = 4) -> list:
         return []
 
 
+# ── BFS 沿 wikilink 扩展（2026-08-23，借鉴 TencentDB-Agent-Memory graph-search） ──
+# 原则：seed 命中 → 沿 wiki_links 边（[[wikilink]]）向外扩展，hop 每跳衰减；只返回
+# 标题（详情留待调用方决定是否展开正文），压缩注入体积。
+def _wiki_bfs_titles(seeds: list, hop: int = 1, decay: float = 0.5, max_nodes: int = 30) -> list:
+    """从 seed 标题出发 BFS 沿 wikilink 扩展，返回 [(title, hop, score), ...]（按分数降序）。
+
+    - seeds: 起始 title 列表（可含 rel_path 混用，函数内解析）
+    - hop: 最大扩展跳数（1 = 只取 seed 的直接邻居；0 = 只返回 seed 本身）
+    - decay: 每跳分数衰减系数
+    - max_nodes: 访问节点硬上限（防稠密图爆炸）
+    """
+    if not WIKI_DB.exists():
+        return []
+    import sqlite3
+    try:
+        con = sqlite3.connect(WIKI_DB)
+    except Exception:
+        return []
+    # 解析 seed → title（rel_path 或 title 均可）
+    seed_titles = []
+    for s in seeds:
+        if not s:
+            continue
+        row = con.execute("SELECT title FROM wiki_docs WHERE rel_path=?", (s,)).fetchone()
+        if row:
+            seed_titles.append(row[0])
+        elif con.execute("SELECT 1 FROM wiki_docs WHERE title=?", (s,)).fetchone():
+            seed_titles.append(s)
+    if not seed_titles:
+        return []
+    # BFS
+    best: dict = {}          # title -> score（取最高分路径）
+    min_hop: dict = {}       # title -> 最小 hop
+    frontier = []
+    for t in seed_titles:
+        best[t] = max(best.get(t, 0.0), 1.0)
+        min_hop[t] = 0
+        frontier.append((t, 0))
+    visited = set(seed_titles)
+    while frontier and len(visited) < max_nodes:
+        nxt = []
+        for title, h in frontier:
+            if h >= hop:
+                continue
+            rows = con.execute(
+                "SELECT DISTINCT dst_title FROM wiki_links WHERE src_id IN "
+                "(SELECT id FROM wiki_docs WHERE title=?)", (title,)).fetchall()
+            for (dst,) in rows:
+                if dst in visited:
+                    continue
+                visited.add(dst)
+                nh = h + 1
+                score = 1.0 * (decay ** nh)
+                if score > best.get(dst, 0.0):
+                    best[dst] = score
+                    min_hop[dst] = nh
+                nxt.append((dst, nh))
+        frontier = nxt
+    # 反向边也走一跳（邻居指向当前 seed 的也值得带出）——仅 hop=1 时做一次
+    if hop >= 1:
+        for t in seed_titles:
+            rows = con.execute(
+                "SELECT DISTINCT src.title FROM wiki_links l JOIN wiki_docs src ON l.src_id=src.id "
+                "JOIN wiki_docs dst ON dst.title=l.dst_title WHERE dst.title=?", (t,)).fetchall()
+            for (src_title,) in rows:
+                if src_title in visited:
+                    continue
+                visited.add(src_title)
+                score = 1.0 * decay
+                if score > best.get(src_title, 0.0):
+                    best[src_title] = score
+                    min_hop[src_title] = 1
+    out = [(t, min_hop.get(t, 0), s) for t, s in best.items()]
+    out.sort(key=lambda x: (-x[2], x[1]))
+    return out[:max_nodes]
+
+
 def lane4(q_entities: set, budget: int, query: str = "") -> list:
     """L4 wiki 通道：① wiki 全库索引检索（主入口，trigram，不依赖 L1 指针——L1 预算放不下全库指针）；
-    ② L1 条目 `→ wiki/路径` 活指针跟随（兼容保留，模板/目录指针支持）。"""
+    ② BFS 沿 wikilink 扩展 seed 关联页（2026-08-23，借鉴 TencentDB-Agent-Memory graph-search）；
+    ③ L1 条目 `→ wiki/路径` 活指针跟随（兼容保留，模板/目录指针支持）。"""
     out = []
     seen = set()
-    # ① 全库索引检索
+    # ① 全库索引检索（seed）
+    seeds = []
     for rel, title in _wiki_index_hits(query, limit=4):
         if rel in seen:
             continue
         seen.add(rel)
+        seeds.append(title)
         for target in _resolve_wiki(rel):
             try:
                 text = target.read_text(errors="ignore")
@@ -492,7 +627,20 @@ def lane4(q_entities: set, budget: int, query: str = "") -> list:
             rel_show = str(target.relative_to(WIKI_ROOT.parent))
             out.append((round(1.0, 2), f"[L4 wiki:{rel_show}] {title} | {text[:budget]}"))
             break
-    # ② L1 活指针跟随（原有逻辑）
+    # ② BFS 沿 wikilink 扩展（只列标题，不展开正文；hop=1 取直接邻居，省 token）
+    if seeds:
+        for title, hop, score in _wiki_bfs_titles(seeds, hop=1, decay=0.5, max_nodes=12):
+            if title in seeds:
+                continue  # seed 本身已返回
+            row = _title_to_rel(title)
+            if not row:
+                continue
+            rel = row
+            if rel in seen:
+                continue
+            seen.add(rel)
+            out.append((round(score, 2), f"[L4 wiki邻接 hop{hop}] {title}（{rel}）"))
+    # ③ L1 活指针跟随（原有逻辑）
     for ent in load_l1():
         if not (q_entities & set(ent["entities"])):
             continue
@@ -722,7 +870,9 @@ def main() -> None:
         # 无卡降级为常规召回（维持既有注入能力）
 
     l1 = lane1(args.query, q_entities)
-    l2 = [(1.0, t) for t in lane2(args.query)]
+    l2_raw = lane2(args.query)
+    corrections = load_corrected()
+    l2 = [(1.0, (f"⚠曾被纠正 {t}" if is_corrected(t, corrections) else t)) for t in l2_raw]
     l3 = lane3_mcp(args.query) if not args.l3 else lane3(args.l3)
     l4 = lane4(q_entities, max(200, args.budget // 4), args.query)
 

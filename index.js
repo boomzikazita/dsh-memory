@@ -269,6 +269,16 @@ export function apply(ctx, config = {}) {
           return `[memory_suggest] 内容含敏感模式（${p.label}），禁止写入明文记忆。请改用 memory_vault_set 存加密库，明文只留 → vault:<ref> 引用。`
         }
       }
+      // Persona 约束（2026-08-23，借鉴 TencentDB-Agent-Memory persona-generation）：
+      // USER.md 是用户画像，遵守四条：长度上限、禁止过度推测、只从对话数据来、冷启动克制。
+      if (track === 'user') {
+        if (content.length > 2000) {
+          return `[memory_suggest] USER.md persona 超长（${content.length} 字符 > 2000）。请精简为画像级表述，细节归 wiki/vault。`
+        }
+        if (/(推测|可能是个|应该是|估计(?:是|他|她))/.test(content)) {
+          return `[memory_suggest] persona 含推测性表述（过度推测禁止）：画像只能来自对话中明确说出的信息，宁缺毋滥。请改写为已确认事实。`
+        }
+      }
       // 预算检查
       const budget = budgetFor(track)
       const current = charCount(targetFor(track))
@@ -289,7 +299,7 @@ export function apply(ctx, config = {}) {
       const overlaps = findOverlaps(content)
       if (overlaps.length) {
         const parts = overlaps.map((o) => `${o.kind}[${o.overlap}%${o.tags ? `,标签${o.tags}` : ''}]「${o.head}…」`)
-        warn = ` ⚠️ 与既有记忆重叠：${parts.join('；')}。建议采纳时合并/更新既有条目而非新增（L1 预算 ${current + extra}/${budget}）。`
+        warn = ` ⚠️ 与既有记忆重叠：${parts.join('；')}。建议采纳时合并/更新既有条目而非新增（可调 memory_conflict detect 看批量候选、merge 执行合并；L1 预算 ${current + extra}/${budget}）。`
       }
       if (lifecycle === 'record') warn += '（提示：record=完成记录，按治理规则应归 wiki 而非 L1，weekly-review 会提归档）'
       if (lifecycle === 'situational') warn += `（情境类，expires=${expires}，到期 weekly-review 提归档）`
@@ -302,8 +312,17 @@ export function apply(ctx, config = {}) {
     if (item.track === 'skill') {
       const slug = (item.content.match(/name:\s*([a-z0-9-]+)/i)?.[1]) || `skill-${Date.now()}`
       const dir = join(HOME, '.dsh', 'skills', slug)
+      const skillFile = join(dir, 'SKILL.md')
+      // 内容 hash 幂等（2026-08-23，借鉴 TencentDB-Agent-Memory skill-versioning）：
+      // 与已落盘 SKILL.md 内容相同则拒绝，防重复蒸馏/重复提交
+      if (existsSync(skillFile)) {
+        const prev = readFileSync(skillFile, 'utf8')
+        if (createHash('md5').update(prev).digest('hex') === createHash('md5').update(item.content).digest('hex')) {
+          return `内容与 ~/.dsh/skills/${slug}/SKILL.md 完全相同（md5 一致），已存在，拒绝重复落盘`
+        }
+      }
       mkdirSync(dir, { recursive: true })
-      writeFileSync(join(dir, 'SKILL.md'), item.content)
+      writeFileSync(skillFile, item.content)
       return `已写入 ~/.dsh/skills/${slug}/SKILL.md`
     }
     // trigger 兜底（2026-08-19）：历史提案可能无 trigger，落盘前补齐
@@ -352,6 +371,43 @@ export function apply(ctx, config = {}) {
       item.status = 'rejected'
       saveSuggestions(list)
       return `[memory_reject] 已拒绝 ${input.id}`
+    },
+  }))
+
+  // ---------- 2.5 工具：memory_conflict（L1 批量冲突检测 + 合并执行，2026-08-23） ----------
+  // 借鉴 TencentDB-Agent-Memory l1-dedup：批量比较新记忆 vs 候选池，产出
+  // store/skip/update/merge 动作；机械层由 conflict_detect.py 完成，语义兜底由 agent
+  // 决策，合并落盘走 conflict_merge.py（时间戳并集 + pre-image 审计）。
+  ctx.tools.register(defineTool({
+    name: 'memory_conflict',
+    description: 'L1 批量冲突检测与合并执行：①检测=扫描 pending 提案 vs 既有 MEMORY.md/USER.md 条目，输出 store/skip/update/merge 候选（agent 复核语义后执行）；②合并=把多条相关记忆合并为一条（删除目标条目+写入合并内容+时间戳并集+记 DREAMS.md）。合并/采纳前调用可抑制记忆冗余。',
+    parameters: {
+      action: { type: 'string', required: true, description: 'detect=批量冲突检测（默认） / merge=执行合并 / replace=单条目原位更新' },
+      track: { type: 'string', description: 'memory / user，默认 memory' },
+      content: { type: 'string', description: 'merge/replace 时的合并后内容（merge 必填）' },
+      targetIds: { type: 'array', items: { type: 'string' }, description: '目标条目：L1 索引（0-based，detect 输出里的 target_id）或内容子串；merge 可多个（多对多合并），replace 一个' },
+      dryRun: { type: 'boolean', description: '只显示将执行的变更，不落盘（默认 false）' },
+    },
+    output: { schema: { type: 'string', description: '检测结果或合并结果' }, render: (args, value) => [{ type: 'text', text: value }] },
+    async execute(input) {
+      const action = input?.action ?? 'detect'
+      const track = input?.track ?? 'memory'
+      if (!['memory', 'user'].includes(track)) return `[memory_conflict] track 必须为 memory/user`
+      if (action === 'detect') {
+        const r = py('conflict_detect.py', ['--track', track])
+        return r.ok ? r.out : `[memory_conflict] 检测失败：${r.out}`
+      }
+      if (action === 'merge' || action === 'replace') {
+        const content = input?.content ?? ''
+        const ids = Array.isArray(input?.targetIds) ? input.targetIds.map(String) : (input?.targetIds ? [String(input.targetIds)] : [])
+        if (!ids.length) return `[memory_conflict] ${action} 需要 targetIds`
+        if (action === 'merge' && !content.trim()) return `[memory_conflict] merge 需要 content（合并后内容）`
+        const args = [action, track, ...(action === 'merge' ? [content, ...ids] : [ids[0], content])]
+        if (input?.dryRun) args.push('--dry-run')
+        const r = py('conflict_merge.py', args)
+        return r.ok ? r.out : `[memory_conflict] ${action} 失败：${r.out}`
+      }
+      return `[memory_conflict] action 必须为 detect/merge/replace`
     },
   }))
 

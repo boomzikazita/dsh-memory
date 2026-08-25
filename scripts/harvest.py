@@ -184,9 +184,28 @@ def daily_append(summary: str) -> None:
 
 
 def extract_signals(limit: int = 200) -> int:
-    """扫描最近 user 消息中的纠正信号"""
+    """扫描最近 user 消息中的纠正信号，回溯被纠正的 assistant 消息一并记录。
+
+    2026-08-23 补断环：纠正信号此前只沉淀不消费（corrections.jsonl 写了没人读，
+    且没关联"被纠正的内容"，读也匹配不到 L2 索引）。现回溯 seq 之前最近一条
+    assistant 消息存为 corrected 字段，供 rrf_recall L2 召回对被纠正内容做
+    ⚠ 标注（确定性标记、不裁决——agent 自行降信任）。
+    幂等：按 (session, seq) 去重，避免 timer 重复跑造成重复条目。
+    """
     if not SESSIONS_ROOT.exists():
         return 0
+    # 幂等去重：读已有 (session, seq) 集合
+    existing = set()
+    if CORRECTIONS_FILE.exists():
+        try:
+            for line in CORRECTIONS_FILE.open(encoding="utf-8"):
+                try:
+                    r = json.loads(line)
+                    existing.add((r.get("session"), r.get("seq")))
+                except Exception:
+                    continue
+        except Exception:
+            pass
     found = 0
     MEMORIES.mkdir(parents=True, exist_ok=True)
     for ws in SESSIONS_ROOT.iterdir():
@@ -199,29 +218,44 @@ def extract_signals(limit: int = 200) -> int:
             raw = unzstd(log)
             if raw is None:
                 continue
+            last_assistant = ""  # 每个 session 独立回溯：seq 之前最近一条 assistant 消息
             for line in raw.splitlines():
                 try:
                     ev = json.loads(line)
                 except Exception:
                     continue
-                if ev.get("type") != "user/message":
-                    continue
                 data = ev.get("data") or {}
+                t = ev.get("type")
+                if t == "assistant/message":
+                    msg = data.get("message") or {}
+                    atext = extract_text_blocks(msg.get("content"))
+                    if atext:
+                        last_assistant = atext
+                    continue
+                if t != "user/message":
+                    continue
                 src = data.get("source") or {}
                 if src.get("kind") != "user":
                     continue  # 跳过插件/系统注入（召回回路防护）
                 text = extract_text_blocks(data.get("content")) or ""
-                if CORRECTION_PATTERNS.search(text):
-                    with open(CORRECTIONS_FILE, "a") as fh:
-                        fh.write(json.dumps({
-                            "ts": ev.get("ts") or datetime.datetime.now().isoformat(),
-                            "session": sess.name,
-                            "seq": ev.get("seq"),
-                            "text": text.strip()[:500],
-                        }, ensure_ascii=False) + "\n")
-                    found += 1
-                    if found >= limit:
-                        return found
+                if not CORRECTION_PATTERNS.search(text):
+                    continue
+                key = (sess.name, ev.get("seq"))
+                if key in existing:
+                    continue
+                record = {
+                    "ts": ev.get("ts") or datetime.datetime.now().isoformat(),
+                    "session": sess.name,
+                    "seq": ev.get("seq"),
+                    "text": text.strip()[:500],
+                }
+                if last_assistant:
+                    record["corrected"] = last_assistant[:500]
+                with open(CORRECTIONS_FILE, "a") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                found += 1
+                if found >= limit:
+                    return found
     return found
 
 

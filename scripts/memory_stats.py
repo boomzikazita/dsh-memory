@@ -20,11 +20,32 @@ INDEX = MEM / "index.json"
 USAGE = MEM / ".usage.json"
 CORRECTIONS = MEM / "corrections.jsonl"
 SCRIPT_DIR = Path.home() / ".dsh" / "plugins" / "dsh-memory" / "scripts"
+# 预算单一数据源：cordis.patch.yml 的 dsh-memory config（避免硬编码失配，2026-08-23 修 4400→5000）
+PATCH_YML = Path.home() / ".dsh" / "profiles" / "web" / "cordis.patch.yml"
+DEFAULT_BUDGETS = {"MEMORY.md": 5000, "USER.md": 3000}
+
+
+def _read_budgets() -> dict:
+    """从 cordis.patch.yml 读 dsh-memory 的预算配置；读不到用默认（与插件 index.js 默认对齐）"""
+    budgets = dict(DEFAULT_BUDGETS)
+    try:
+        txt = PATCH_YML.read_text(encoding="utf-8")
+        import re
+        mm = re.search(r"budgetMemory:\s*(\d+)", txt)
+        mu = re.search(r"budgetUser:\s*(\d+)", txt)
+        if mm:
+            budgets["MEMORY.md"] = int(mm.group(1))
+        if mu:
+            budgets["USER.md"] = int(mu.group(1))
+    except Exception:
+        pass
+    return budgets
 
 
 def budget_stats() -> dict:
+    limits = _read_budgets()
     out = {}
-    for f, limit in [("MEMORY.md", 4400), ("USER.md", 2750)]:
+    for f, limit in limits.items():
         p = MEM / f
         if p.exists():
             n = len(p.read_text(encoding="utf-8"))
