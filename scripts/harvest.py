@@ -48,6 +48,20 @@ def unzstd(path) -> str | None:
         return None
 
 
+# 会话日志命名（2026-10-14 修）：dsh 0.2 起为 session.v4.jsonl.zstd，旧名为 session.jsonl.zstd。
+# 原实现硬编码旧名 → iter_session_files() 返回 0 个文件，L2 转录与 honcho_sync 写入链双双静默停摆。
+SESSION_LOG_GLOBS = ("session*.jsonl.zstd", "session*.jsonl")
+
+
+def session_log_path(sess_dir):
+    """定位会话日志（兼容新旧命名与未压缩 .jsonl）。"""
+    for pat in SESSION_LOG_GLOBS:
+        hits = sorted(p for p in sess_dir.glob(pat) if p.is_file())
+        if hits:
+            return hits[-1]
+    return None
+
+
 def iter_session_files():
     if not SESSIONS_ROOT.exists():
         return
@@ -55,8 +69,10 @@ def iter_session_files():
         if not ws.is_dir():
             continue
         for sess in ws.iterdir():
-            log = sess / "session.jsonl.zstd"
-            if log.exists():
+            if not sess.is_dir():
+                continue
+            log = session_log_path(sess)
+            if log:
                 yield ws.name, sess.name, log
 
 
@@ -212,8 +228,8 @@ def extract_signals(limit: int = 200) -> int:
         if not ws.is_dir():
             continue
         for sess in ws.iterdir():
-            log = sess / "session.jsonl.zstd"
-            if not log.exists():
+            log = session_log_path(sess)
+            if not log:
                 continue
             raw = unzstd(log)
             if raw is None:

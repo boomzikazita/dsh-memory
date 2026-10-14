@@ -1,6 +1,11 @@
-# dsh-memory bundle patch — 记忆插件挂载（惰性声明；实际挂载见 web profile cordis.patch.yml 的绝对路径 insert）
+# dsh-memory bundle patch — 记忆插件挂载（profile 的 dsh.profile.bundles 列了 dsh-memory 即自动应用本 patch；
+# 旧注释「实际挂载见 web profile cordis.patch.yml 的绝对路径 insert」已过期——web/cordis.patch.yml 里并无该 insert）
+# v0.2.0：resource 工具已并入本包（scripts/resource.py 同包）；Python 解释器可用 config.python 覆盖（默认 python3）
+# 2026-10-14：恢复 L1 预算 5000/3000（口径见 wiki 状态卡 2026-08-20；10 月重装后曾回落插件默认 4400/2750，属配置丢失）
 - insert:
     - id: dsh-memory
       name: 'dsh-memory'
       config:
         memoryDir: '~/.dsh/memories'
+        budgetMemory: 5000
+        budgetUser: 3000

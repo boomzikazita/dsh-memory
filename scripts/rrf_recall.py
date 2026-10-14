@@ -288,7 +288,26 @@ def lane3(l3_file: str | None) -> list:
 
 # ---------- L3 MCP 直连（honcho-codex-bridge，streamable-http） ----------
 MCP_URL = os.environ.get("DSH_HONCHO_MCP_URL", "http://10.173.48.28:8001/mcp")
-MCP_TOKEN = os.environ.get("DSH_HONCHO_MCP_TOKEN", "honcho-codex-2026")
+# Token 优先级：环境变量 → 密钥文件 → 占位符。
+# 2026-10-14 新增文件回退：dsh web/headless 进程启动环境里没有 DSH_HONCHO_MCP_TOKEN，
+# 原先直接用占位符 → 桥返回 401 → lane3 静默降级为 []（L3 实际长期失效）。
+_TOKEN_FILE = pathlib.Path.home() / ".dsh" / ".honcho-mcp-token"
+
+
+def _mcp_token() -> str:
+    env = os.environ.get("DSH_HONCHO_MCP_TOKEN")
+    if env:
+        return env
+    try:
+        tok = _TOKEN_FILE.read_text().strip()
+        if tok:
+            return tok
+    except Exception:
+        pass
+    return "CHANGEME_HONCHO_TOKEN"
+
+
+MCP_TOKEN = _mcp_token()
 
 
 def _mcp_rpc(method: str, params: dict, session_id: str | None = None):
@@ -331,7 +350,10 @@ def lane3_mcp(query: str) -> list:
         sid2, out = _mcp_rpc("tools/call", {"name": "honcho_search", "arguments": {"query": query}}, sid)
         texts = _mcp_sse_text(out)
         return [(1.0, t) for t in texts]
-    except Exception:
+    except Exception as e:
+        # 默认静默（L3 可选层）；排查时 DSH_MEMORY_L3_DEBUG=1 显示降级原因
+        if os.environ.get("DSH_MEMORY_L3_DEBUG"):
+            print(f"[lane3_mcp] 降级 → []: {type(e).__name__}: {e}", file=sys.stderr)
         return []
 
 
@@ -363,8 +385,17 @@ def _title_to_rel(title: str) -> str | None:
         return None
 
 
+def _session_log(sess_dir):
+    """定位会话日志（2026-10-14 修：dsh 0.2 起为 session.v4.jsonl.zstd；旧名 session.jsonl.zstd）"""
+    for pat in ("session*.jsonl.zstd", "session*.jsonl"):
+        hits = sorted(p for p in sess_dir.glob(pat) if p.is_file())
+        if hits:
+            return hits[-1]
+    return None
+
+
 def _unzstd(path) -> str | None:
-    """解压 session.jsonl.zstd（复用 harvest.py 的 unzstd 实现）"""
+    """解压会话日志 .zstd（复用 harvest.py 的 unzstd 实现）"""
     try:
         out = subprocess.run(["unzstd", "-c", str(path)], capture_output=True, text=True, timeout=30)
         return out.stdout if out.returncode == 0 else None
@@ -431,8 +462,8 @@ def lane5(date: datetime.date | None, limit: int = 40) -> list:
         for sess in sess_dirs:
             if not sess.is_dir():
                 continue
-            log = sess / "session.jsonl.zstd"
-            if not log.exists():
+            log = _session_log(sess)
+            if not log:
                 continue
             raw = _unzstd(log)
             if not raw:

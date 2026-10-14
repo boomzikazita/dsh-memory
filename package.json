@@ -1,13 +1,22 @@
 {
   "name": "dsh-memory",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.js",
-  "description": "DSH 专属记忆插件：RRF 四路召回 / 确认制写入 / Fernet 加密库 / 会话转录 / 维护工具（HMS 架构移植）",
-  "dependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6"
+  "description": "DSH 专属记忆插件：RRF 四路召回 / 确认制写入 / Fernet 加密库 / 会话转录 / 维护工具（HMS 架构移植）。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source、fileURLToPath 路径、exec.arguments ?? exec.args）；并入 resource 工具（自 dsh-resource，scripts/resource.py 同包携带）；Python 子进程走 config.python + UTF-8 env。",
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   },
   "dsh": {
     "bundle": {

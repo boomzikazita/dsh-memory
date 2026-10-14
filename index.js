@@ -1,6 +1,15 @@
 /**
  * dsh-memory — DSH 专属记忆插件（HMS 架构 → DSH 实现）
  *
+ * v0.2.0（2026-10-14，dsh 0.2 适配 + resource 并入）：
+ *   1. 删除 `export const Config = null`（Config 不导出才安全，null 会崩设置页）
+ *   2. 并入 resource 工具（自 dsh-resource 迁入，工具名不变）：scripts/resource.py 同包携带，
+ *      resource.py 内对 memory scripts 目录的跨插件探测改为同包相对路径
+ *   3. Python 子进程：解释器读 config.python（默认 python3），env 补 PYTHONIOENCODING=utf-8 /
+ *      PYTHONUTF8=1；SCRIPTS_DIR 改 fileURLToPath(import.meta.url)（铁律 F）
+ *   4. agent/pre-step 注入 source 改 v4 形态 { kind: 'plugin:dsh-memory' }；
+ *      guard 钩子执行参数读 exec.arguments ?? exec.args
+ *
  * 分层：L1 规则(MEMORY/USER) / L2 会话 FTS5 / L3 语义(可选 MCP) / L4 wiki 活指针
  *       + RRF 四路融合 + 确认制写入 + Fernet 加密库 + 维护自动化工具
  *
@@ -15,15 +24,16 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { resolve, join, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'dsh-memory'
 export const inject = ['tools', 'agents']
-export const Config = null
 
 const HOME = homedir()
 const DEFAULT_MEMORY_DIR = join(HOME, '.dsh', 'memories')
-const SCRIPTS_DIR = join(dirname(new URL(import.meta.url).pathname), 'scripts')
+// 铁律 F：fileURLToPath 解析插件自身路径（new URL().pathname 裸取在 Windows 产非法路径）
+const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'scripts')
 
 // 敏感模式（写前扫描；命中 → 警告/拦截/重定向 vault）
 const SENSITIVE_PATTERNS = [
@@ -102,14 +112,17 @@ export function apply(ctx, config = {}) {
   const guardBlock = config.guardBlock === true
   const primerBudget = Number(config.primerBudget ?? 800)
   const primerTopK = Number(config.primerTopK ?? 3)
+  // v0.2.0：Python 解释器走 config.python（默认 python3）；env 强制 UTF-8 防中文输出乱码
+  const PYTHON = config.python || 'python3'
+  const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
 
   const state = { pendingWarns: [] }
 
   // ---------- 工具函数 ----------
   const py = (script, args, input) => {
     try {
-      const out = execFileSync('python3', [join(scriptsDir, script), ...args], {
-        input: input ?? '', encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024,
+      const out = execFileSync(PYTHON, [join(scriptsDir, script), ...args], {
+        input: input ?? '', encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024, env: PY_ENV,
       })
       return { ok: true, out: out.trim() }
     } catch (e) {
@@ -292,18 +305,22 @@ export function apply(ctx, config = {}) {
         ts: new Date().toISOString(), track, content, status: 'pending', lifecycle,
       }
       if (expires) item.expires = expires
+      // 同主题重叠检测（2026-08-22）：提示与既有 L1 / pending 提案的合并候选，抑制记忆冗余。
+      // 2026-10-14 修正：必须在入队前计算——否则 loadSuggestions() 会把刚 push 的提案自己
+      // 判成 100% 重叠（每次提交都误报"与既有记忆重叠 pending[100%]"）。
+      const overlaps = findOverlaps(content)
       suggestions.push(item)
       saveSuggestions(suggestions)
       let warn = ''
-      // 同主题重叠检测（2026-08-22）：提示与既有 L1 / pending 提案的合并候选，抑制记忆冗余
-      const overlaps = findOverlaps(content)
       if (overlaps.length) {
         const parts = overlaps.map((o) => `${o.kind}[${o.overlap}%${o.tags ? `,标签${o.tags}` : ''}]「${o.head}…」`)
         warn = ` ⚠️ 与既有记忆重叠：${parts.join('；')}。建议采纳时合并/更新既有条目而非新增（可调 memory_conflict detect 看批量候选、merge 执行合并；L1 预算 ${current + extra}/${budget}）。`
       }
       if (lifecycle === 'record') warn += '（提示：record=完成记录，按治理规则应归 wiki 而非 L1，weekly-review 会提归档）'
       if (lifecycle === 'situational') warn += `（情境类，expires=${expires}，到期 weekly-review 提归档）`
-      return `[memory_suggest] 提案 ${item.id} 已入队（track=${track} lifecycle=${lifecycle}${expires ? ` expires=${expires}` : ''}，队列共 ${suggestions.length} 条）${warn}。待 memory_confirm 采纳。`
+      // 2026-10-14：条数口径与 memory_health 对齐——只数 pending（原先数全量行，含已 rejected，显得像积压）
+      const pendingCount = suggestions.filter((s) => s.status === 'pending').length
+      return `[memory_suggest] 提案 ${item.id} 已入队（track=${track} lifecycle=${lifecycle}${expires ? ` expires=${expires}` : ''}，待确认队列共 ${pendingCount} 条）${warn}。待 memory_confirm 采纳。`
     },
   }))
 
@@ -355,6 +372,7 @@ export function apply(ctx, config = {}) {
       if (!item) return `[memory_confirm] 未找到待确认提案 ${input.id}`
       const result = await applyConfirmed(item)
       item.status = 'confirmed'
+      item.confirmedAt = new Date().toISOString()  // 增益验证门（EDGE 启发）：记录采纳时间，供零命中检测
       saveSuggestions(list)
       return `[memory_confirm] ${result}`
     },
@@ -408,6 +426,22 @@ export function apply(ctx, config = {}) {
         return r.ok ? r.out : `[memory_conflict] ${action} 失败：${r.out}`
       }
       return `[memory_conflict] action 必须为 detect/merge/replace`
+    },
+  }))
+
+  // ---------- 3.5 工具：memory_zero_hit（增益验证门，EDGE 启发，2026-08-25） ----------
+  // 借鉴 EDGE（arXiv:2608.21946）：不是所有记忆都值得长期保留，只有被验证带来
+  // 正增益（被召回/被用到）的才值得留在 L1。本工具不拦截写入，只做观测：
+  // 扫描 MEMORY.md/USER.md 条目，对照 .usage.json 的召回统计，报告零命中/陈旧条目。
+  ctx.tools.register(defineTool({
+    name: 'memory_zero_hit',
+    description: '增益验证门（EDGE 启发）：扫描 L1 条目，对照召回统计（.usage.json），报告"已采纳但从未被召回/长期未召回"的零增益条目，供 weekly-review 或人工淘汰。只读不改。',
+    parameters: { days: { type: 'number', description: '陈旧阈值天数，默认 30（N 天未召回视为陈旧）' } },
+    output: { schema: { type: 'string', description: '零增益条目报告' }, render: (args, value) => [{ type: 'text', text: value }] },
+    async execute(input) {
+      const days = Number(input?.days) || 30
+      const r = py('memory_zero_hit.py', ['--days', String(days)])
+      return r.ok ? r.out : `[memory_zero_hit] 失败：${r.out}`
     },
   }))
 
@@ -549,13 +583,62 @@ export function apply(ctx, config = {}) {
     },
   }))
 
+  // ---------- 5c. 工具：resource（统一资源视图 mem://+wiki:// 只读门面，v0.2.0 自 dsh-resource 并入） ----------
+  // 设计（2026-08-22，Mirage"抄心智不抄架构" + codex world-state 思想）：
+  //   一个工具三个原语：ls（域里有什么）/ read（读引用）/ search（跨域检索）；
+  //   引用格式 <ns>://<path>：路径即身份；只读优先，路径穿越防护与输出上限在 scripts/resource.py。
+  //   不吞并专用能力：深度语义召回走 memory_recall；加密库走 memory_vault_get；写操作走原工具。
+  // v0.2.0 并入后：resource.py 与本包 scripts 同目录（同包相对路径，不再跨插件探测），
+  //   解释器走 config.python（PY_ENV 编码修正）。
+  ctx.tools.register(defineTool({
+    name: 'resource',
+    description:
+      '统一资源视图（只读）：一个入口访问多数据源。verb=ls 列举域内容 / read 读取引用 / search 检索。' +
+      '命名空间：mem://（实体表 person/project/topic、规则条目、MEMORY.md/USER.md/DREAMS.md）、' +
+      'wiki://（Obsidian 知识库目录与笔记）、scripts://（~/.dsh/scripts + ~/.hermes/scripts 脚本清单）。' +
+      '引用格式 <ns>://<路径>，如 mem://（总览）、mem://person/句号（沿边+摘要）、mem://MEMORY.md、wiki://concepts。' +
+      'search 为跨域检索（mem 语义召回 + wiki grep + 图谱沿边）；ls 加 filter 按子串过滤。' +
+      '注意：深度语义召回请用 memory_recall；加密库请用 memory_vault_get；写操作请用原工具。',
+    parameters: {
+      verb: { type: 'string', required: true, description: 'ls（列举）/ read（读取）/ search（检索）' },
+      ref: { type: 'string', description: '引用 <ns>://<路径>，如 mem://MEMORY.md、mem://（顶层）、wiki://concepts' },
+      query: { type: 'string', description: 'search 的查询词（跨域时不带 ref）' },
+      filter: { type: 'string', description: 'ls 结果按子串过滤（可选）' },
+    },
+    output: {
+      schema: { type: 'string', description: '资源视图文本' },
+      render: (args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(input) {
+      const verb = input?.verb
+      if (!['ls', 'read', 'search'].includes(verb)) {
+        return '[resource] verb 必须为 ls / read / search'
+      }
+      const args = [join(scriptsDir, 'resource.py'), '--verb', String(verb)]
+      if (input?.ref) args.push('--ref', String(input.ref))
+      if (input?.query) args.push('--query', String(input.query))
+      if (input?.filter) args.push('--filter', String(input.filter))
+      try {
+        return execFileSync(PYTHON, args, {
+          encoding: 'utf-8',
+          timeout: 30000,
+          maxBuffer: 2 * 1024 * 1024,
+          env: PY_ENV,
+        }).trimEnd()
+      } catch (e) {
+        const msg = e?.stderr || e?.message || String(e)
+        return `[resource] 执行失败：${String(msg).slice(0, 300)}`
+      }
+    },
+  }))
+
   // ---------- 6. 钩子：guard（tools/pre-execute 敏感扫描） ----------
   if (typeof ctx.on === 'function') {
     try {
       ctx.on('tools/pre-execute', (exec, next) => {
         const toolName = exec?.tool?.name || exec?.name
         if (!toolName || !WRITE_TOOLS.has(toolName)) return next()
-        const argsText = JSON.stringify(exec?.arguments ?? {})
+        const argsText = JSON.stringify(exec?.arguments ?? exec?.args ?? {})
         if (EXEMPT_PATH.test(argsText)) return next()
         const hit = SENSITIVE_PATTERNS.find((p) => p.re.test(argsText))
         if (hit) {
@@ -609,7 +692,7 @@ export function apply(ctx, config = {}) {
             const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
             const msg = createUserMessage({
               content: [{ type: 'text', text: parts.join('\n\n') }],
-              source: { kind: 'plugin', plugin: 'dsh-memory' },
+              source: { kind: 'plugin:dsh-memory' },
             })
             return { ...decision, messages: [...decision.messages, msg] }
           } catch { return decision }

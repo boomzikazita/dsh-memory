@@ -23,7 +23,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 import harvest  # 复用 unzstd / iter_session_files / extract_text_blocks
 
 HONCHO_BASE = "http://127.0.0.1:8000"
-WS = "dsh"
+# 2026-10-14：写入从 workspace=dsh 迁到 workspace=hermes。
+# 原因：桥（L3 唯一读取入口）的口径是 hermes 工作区的 hermes→laozheng，写进 dsh 工作区的内容
+# L3 永远看不到。现写 hermes/dsh-agent→laozheng，桥侧以 HONCHO_EXTRA_OBSERVERS=dsh-agent 并查，
+# 既保住来源标识（observer=dsh-agent，与 dsh 工作区 370 条历史同身份）又能被召回。
+WS = "hermes"
 OBSERVER = "dsh-agent"
 OBSERVED = "laozheng"
 STATE_FILE = Path.home() / ".dsh" / "memories" / "honcho-sync-state.json"
@@ -124,9 +128,19 @@ def sync(days: int, dry: bool) -> int:
 
 
 def check():
+    """自检：统计 dsh 会话已写入 Honcho 的结论数。
+
+    2026-10-14 修：原实现 GET /v3/workspaces/{ws}/conclusions?observer_id=... 撞 405——
+    该路径只挂 POST（/conclusions/list 与 /conclusions/query）。改用 /conclusions/list，
+    filters 传 peer 名，返回 {items,total,page,size,pages}。
+    """
     try:
-        n = _req("GET", f"/v3/workspaces/{WS}/conclusions?observer_id={OBSERVER}&observed_id={OBSERVED}", timeout=30)
-        print(f"Honcho workspace[{WS}] 当前结论数: {len(n) if isinstance(n, list) else n}")
+        r = _req("POST", f"/v3/workspaces/{WS}/conclusions/list",
+                 {"filters": {"observer": OBSERVER, "observed": OBSERVED}, "size": 3}, timeout=30)
+        total = r.get("total") if isinstance(r, dict) else len(r)
+        print(f"Honcho workspace[{WS}] {OBSERVER}→{OBSERVED} 结论数: {total}")
+        for it in (r.get("items", []) if isinstance(r, dict) else r)[:3]:
+            print(f"  - {str(it.get('content', ''))[:60]}")
     except Exception as e:
         print(f"查询失败: {e}")
 

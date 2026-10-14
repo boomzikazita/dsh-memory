@@ -7,12 +7,16 @@ as described in the HMS architecture.
 Sources:
   L1: MEMORY.md / USER.md keyword matching (curated facts) + reference following
   L2: session_search FTS5 (historical conversations, real message content)
+      + ReFind (arXiv:2608.12888) ablation mechanisms:
+      session aggregation two-level ranking, ±2 context expansion,
+      optional date_from/date_to time filtering
   L3: Honcho semantic recall (via prefetch result)
-  L4: Obsidian wiki full-text search (knowledge base)
+  L4: Obsidian wiki full-text search (knowledge base, line-level location)
 
 Usage:
   from plugins.memory.honcho.rrf_fuser import rrf_fuse_prefetch
   fused = rrf_fuse_prefetch(query, honcho_context)
+  fused = rrf_fuse_prefetch(query, honcho_context, date_from='2026-10-01')
 """
 
 import re
@@ -177,9 +181,74 @@ def _l1_keyword_match(query: str, top_k: int = 10) -> List[str]:
 
 # ---------------------------------------------------------------------------
 # L2 session_search via SQLite FTS5 (with real content resolution)
+# ReFind (arXiv:2608.12888) ablation-backed mechanisms, all inside this source:
+#   1. session aggregation two-level ranking (message rank r1 + session rank r2,
+#      RRF-fused with the same k=60 as the main fusion)
+#   2. ±2 context expansion around each direct hit (marked via `sessionctx:` ids,
+#      rendered as [上下文扩展] in the evidence ledger)
+#   3. optional date_from/date_to ISO time filter on chunk_meta.observed_at
 # ---------------------------------------------------------------------------
-def _l2_session_search(query: str, top_k: int = 10) -> List[str]:
-    """Search session history via FTS5. Returns session message row IDs."""
+def _normalize_iso_bound(value, is_end: bool):
+    """Normalize an ISO date/datetime bound to ISO text for lexicographic
+    comparison against chunk_meta.observed_at.
+
+    Accepts '2026-10-01' or '2026-10-01T00:00:00'. A date-only date_to is
+    inclusive of the whole day (23:59:59.999999). None/empty/unparseable → None.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if is_end and 'T' not in s and ' ' not in s:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt.isoformat()
+
+
+def _l2_two_level_rank(rows: List, top_k: int, k: int = 60) -> List:
+    """Session aggregation two-level ranking (ReFind).
+
+    rows are FTS5 hits in bm25 order. Message-level rank r1 comes from that
+    order; each session's score is the sum of its member messages' RRF scores,
+    giving session-level rank r2. A message's final score is
+    1/(k+r1) + 1/(k+r2_of_its_session) — messages inherit their session's rank.
+    """
+    msg_score: Dict[object, float] = {}
+    sessions: Dict[object, List] = defaultdict(list)
+    row_session: Dict[object, object] = {}
+    for r1, row in enumerate(rows, 1):
+        rid = row['rowid']
+        msg_score[rid] = 1.0 / (k + r1)
+        skey = row['session'] if row['session'] is not None else ('__none__', rid)
+        row_session[rid] = skey
+        sessions[skey].append(rid)
+    sess_ranked = sorted(
+        sessions.items(),
+        key=lambda kv: sum(msg_score[rid] for rid in kv[1]),
+        reverse=True,
+    )
+    sess_rank = {skey: r2 for r2, (skey, _members) in enumerate(sess_ranked, 1)}
+
+    def final_score(row) -> float:
+        rid = row['rowid']
+        return msg_score[rid] + 1.0 / (k + sess_rank[row_session[rid]])
+
+    return sorted(rows, key=final_score, reverse=True)[:top_k]
+
+
+def _l2_session_search(query: str, top_k: int = 10,
+                       date_from=None, date_to=None) -> List[str]:
+    """Search session history via FTS5. Returns session message row IDs.
+
+    Direct hits are `session:<rowid>` (two-level session-aggregated ranking);
+    ±2 same-session neighbours are appended as `sessionctx:<rowid>`.
+    date_from/date_to (ISO date or datetime strings) restrict hits to
+    chunk_meta.observed_at within [date_from, date_to]; omitted → no filtering.
+    """
     db_path = _memory_dir() / 'index.sqlite'
     if not db_path.exists():
         return []
@@ -188,6 +257,9 @@ def _l2_session_search(query: str, top_k: int = 10) -> List[str]:
     fts_terms = [t for t in primaries + grams if len(t) >= 2]
     if not fts_terms:
         return []
+
+    from_iso = _normalize_iso_bound(date_from, is_end=False)
+    to_iso = _normalize_iso_bound(date_to, is_end=True)
 
     try:
         conn = sqlite3.connect(str(db_path))
@@ -203,15 +275,66 @@ def _l2_session_search(query: str, top_k: int = 10) -> List[str]:
         # dsh 索引：session_chunks FTS5(text, session, seq)
         fts_query = ' OR '.join(f'"{t}"' for t in fts_terms)
         try:
-            cursor.execute(
-                'SELECT rowid FROM session_chunks WHERE session_chunks MATCH ? LIMIT ?',
-                (fts_query, top_k * 2)
-            )
-            results = [f"session:{r['rowid']}" for r in cursor.fetchall()]
+            if from_iso or to_iso:
+                # Time filter joins the observed_at side table. FTS5 MATCH and
+                # bm25() require the table name, not the alias.
+                sql = ('SELECT sc.rowid, sc.session, sc.seq FROM session_chunks sc '
+                       'JOIN chunk_meta cm ON cm.rowid = sc.rowid '
+                       'WHERE session_chunks MATCH ?')
+                params: list = [fts_query]
+                if from_iso:
+                    sql += ' AND cm.observed_at >= ?'
+                    params.append(from_iso)
+                if to_iso:
+                    sql += ' AND cm.observed_at <= ?'
+                    params.append(to_iso)
+                sql += ' ORDER BY bm25(session_chunks) LIMIT ?'
+            else:
+                sql = ('SELECT rowid, session, seq FROM session_chunks '
+                       'WHERE session_chunks MATCH ? ORDER BY bm25(session_chunks) LIMIT ?')
+                params = [fts_query]
+            # Wider candidate pool so session aggregation has signal to work with.
+            cursor.execute(sql, (*params, top_k * 4))
+            rows = cursor.fetchall()
         except sqlite3.OperationalError:
-            results = []
+            rows = []
+
+        if not rows:
+            conn.close()
+            return []
+
+        ranked = _l2_two_level_rank(rows, top_k)
+        direct_ids = [f"session:{r['rowid']}" for r in ranked]
+        seen = {r['rowid'] for r in ranked}
+
+        # Context expansion: ±2 same-session neighbours of each direct hit
+        # (truncated at session boundaries by the session=BETWEEN predicate).
+        expanded_ids: List[str] = []
+        for r in ranked:
+            session = r['session']
+            try:
+                seq = int(r['seq'])
+            except (TypeError, ValueError):
+                continue
+            if session is None:
+                continue
+            try:
+                cursor.execute(
+                    'SELECT rowid FROM session_chunks WHERE session = ? '
+                    'AND CAST(seq AS INTEGER) BETWEEN ? AND ? '
+                    'ORDER BY CAST(seq AS INTEGER)',
+                    (session, seq - 2, seq + 2),
+                )
+                for nb in cursor.fetchall():
+                    nrid = nb['rowid']
+                    if nrid in seen:
+                        continue
+                    seen.add(nrid)
+                    expanded_ids.append(f"sessionctx:{nrid}")
+            except sqlite3.OperationalError:
+                pass
         conn.close()
-        return results
+        return direct_ids + expanded_ids
 
     except Exception:
         return []
@@ -233,15 +356,30 @@ def _l3_parse_honcho(honcho_context: str, top_k: int = 10) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# L4: Obsidian wiki full-text search
+# L4: Obsidian wiki full-text search (line-level location, D3)
 # ---------------------------------------------------------------------------
 _WIKI_CACHE: Dict[str, Tuple[float, str]] = {}
+
+
+def _wiki_hit_line_span(head: str, primaries: List[str], grams: List[str]):
+    """1-based (first, last) lines of `head` containing any term, else None."""
+    first = last = None
+    for i, line in enumerate(head.split('\n'), 1):
+        ll = line.lower()
+        if any(t in ll for t in primaries) or any(g in ll for g in grams):
+            if first is None:
+                first = i
+            last = i
+    return (first, last) if first is not None else None
+
 
 def _l4_wiki_search(query: str, top_k: int = 6) -> List[str]:
     """Search Obsidian wiki (raw/ + concepts/) for relevant notes.
 
     Scores by occurrence count (same weighting as L1) so entity-dense notes
-    rank above generic matches.
+    rank above generic matches. Hit items carry the matched line range:
+    `wiki:<rel>:<start_line>-<end_line>` (plain `wiki:<rel>` when only the
+    filename matched).
     """
     wiki_root = _wiki_root()
     if not wiki_root.exists():
@@ -281,7 +419,11 @@ def _l4_wiki_search(query: str, top_k: int = 6) -> List[str]:
                 score += head_lower.count(g)
             if score >= 2:  # threshold: filter single generic-gram hits
                 rel = p.relative_to(wiki_root)
-                hits.append((score, f"wiki:{rel}"))
+                span = _wiki_hit_line_span(head, primaries, grams)
+                if span:
+                    hits.append((score, f"wiki:{rel}:{span[0]}-{span[1]}"))
+                else:
+                    hits.append((score, f"wiki:{rel}"))
     hits.sort(key=lambda x: x[0], reverse=True)
     return [h[1] for h in hits[:top_k]]
 
@@ -289,18 +431,32 @@ def _l4_wiki_search(query: str, top_k: int = 6) -> List[str]:
 # ---------------------------------------------------------------------------
 # Evidence ledger assembly (with reference following)
 # ---------------------------------------------------------------------------
+_WIKI_RANGE_RE = re.compile(r'^(?P<path>.+):(?P<start>\d+)-(?P<end>\d+)$')
+
+
 def _read_wiki_summary(rel_str: str, max_chars: int = 400) -> str:
     """Read a wiki file by relative path, return first lines summary.
 
-    Accepts both 'raw/...' and 'wiki/raw/...' (strips redundant prefix).
+    Accepts both 'raw/...' and 'wiki/raw/...' (strips redundant prefix),
+    and an optional line-range suffix 'raw/x.md:3-9' (D3 line-level location):
+    the summary is then sliced to those lines and annotated with the range.
     """
     if rel_str.startswith('wiki/'):
         rel_str = rel_str[len('wiki/'):]
+    start_line = end_line = None
+    m = _WIKI_RANGE_RE.match(rel_str)
+    if m:
+        rel_str = m.group('path')
+        start_line, end_line = int(m.group('start')), int(m.group('end'))
     try:
         p = _wiki_root() / rel_str
         if not p.exists():
             return f"(wiki 文件未找到: {rel_str})"
         text = p.read_text(encoding='utf-8', errors='ignore')
+        if start_line is not None:
+            lines = text.split('\n')
+            excerpt = '\n'.join(lines[start_line - 1:end_line])
+            return f"L{start_line}-{end_line} | {excerpt[:max_chars].strip()}"
         # Strip frontmatter
         if text.startswith('---'):
             end = text.find('---', 3)
@@ -344,6 +500,22 @@ def _get_item_text(item_id: str) -> Tuple[str, str]:
             if row:
                 text = (row[0] or '')[:150].strip()
                 return (text, 'session history')
+        except Exception:
+            pass
+        return (item_id, 'session history')
+
+    # --- L2 context expansion neighbour (ReFind ±2 window) ---
+    if item_id.startswith('sessionctx:'):
+        try:
+            chunk_rowid = int(item_id.split(':', 1)[1])
+            conn = sqlite3.connect(str(_memory_dir() / 'index.sqlite'))
+            cur = conn.cursor()
+            cur.execute('SELECT text FROM session_chunks WHERE rowid=?', (chunk_rowid,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                text = (row[0] or '')[:150].strip()
+                return (f"[上下文扩展] {text}", 'session history')
         except Exception:
             pass
         return (item_id, 'session history')
@@ -410,13 +582,16 @@ def _trace_ref(item_id: str) -> str:
 
     Every ledger line carries a deterministic pointer back to ground-truth
     evidence (TencentDB Agent Memory pattern: top-layer symbol → raw source):
-      L1  MEMORY.md:3      → MEMORY.md#3      (memories file, entry index)
-      L2  session:12345    → msg#12345        (state.db messages.id, scrollable)
-      L3  honcho:2         → honcho¶2         (prefetch paragraph cache index)
-      L4  wiki:raw/x.md    → raw/x.md         (vault-relative path)
+      L1  MEMORY.md:3          → MEMORY.md#3        (memories file, entry index)
+      L2  session:12345        → msg#12345          (state.db messages.id, scrollable)
+      L2+ sessionctx:12345     → msg#12345·上下文扩展 (ReFind ±2 expansion neighbour)
+      L3  honcho:2             → honcho¶2           (prefetch paragraph cache index)
+      L4  wiki:raw/x.md:3-9    → raw/x.md:3-9       (vault-relative path + hit lines)
     """
     if item_id.startswith(('MEMORY.md:', 'USER.md:')):
         return item_id.replace(':', '#')
+    if item_id.startswith('sessionctx:'):
+        return 'msg#' + item_id.split(':', 1)[1] + '·上下文扩展'
     if item_id.startswith('session:'):
         return 'msg#' + item_id.split(':', 1)[1]
     if item_id.startswith('honcho:'):
@@ -704,18 +879,24 @@ def _l6_entity_recall(query: str, top_k: int = 8) -> List[str]:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def rrf_fuse_prefetch(query: str, honcho_context: str = "") -> str:
+def rrf_fuse_prefetch(query: str, honcho_context: str = "",
+                      date_from=None, date_to=None) -> str:
     """Run RRF fusion across all memory sources and return ledgdered context.
 
     Sources: L1 built-in memory, L2 session history, L3 Honcho, L4 Obsidian wiki,
     L5 temporal window, L6 entity graph recall.
+
+    date_from/date_to (optional ISO date or datetime strings, e.g. '2026-10-01'
+    or '2026-10-01T00:00:00') restrict the L2 session-history source to
+    messages observed within [date_from, date_to]; omitted → no time filter.
     """
     if not query or not query.strip():
         return ""
 
     # Retrieve from all six sources
     l1_results = _l1_keyword_match(query, top_k=10)
-    l2_results = _l2_session_search(query, top_k=10)
+    l2_results = _l2_session_search(query, top_k=10,
+                                    date_from=date_from, date_to=date_to)
     l3_results = _l3_parse_honcho(honcho_context, top_k=10)
     l4_results = _l4_wiki_search(query, top_k=6)
     l5_results = _l5_temporal_search(query, top_k=8)
