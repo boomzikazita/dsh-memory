@@ -1,6 +1,16 @@
 /**
  * dsh-memory — DSH 专属记忆插件（HMS 架构 → DSH 实现）
  *
+ * v0.2.1（2026-10-15，修 6 处运行期缺陷）：
+ *   1. 转录钩子 `ctx.on('turn/end')` 事件名不存在（turn/end 只是会话事件类型）⇒ L2 从未运行
+ *      → 改 `session/event`（emit，(session,event)）+ 非阻塞 spawn + 每 10 分钟节流
+ *   2. primer/guard 注入因 @deepseek-ai/dsh-llm 不可解析静默失效 → 等价兜底工厂 + 失败回队 + 留痕
+ *   3. memory_zero_hit 的 L1 切分口径与 rrf_recall 不一致（对**所有**条目恒报零命中）→ split("§") 对齐
+ *   4. resource 的 `mem://person/<x>` 未走 safe_resolve（实测可穿越读 vault 外任意 *.md）→ 收敛在 entities 内
+ *   5. rrf_recall 预算耗尽把命中截成 **1 个字符**（输出垃圾 "["）→ 停止展开 + truncated 计数
+ *   6. guard：EXEMPT_PATH 只判路径字段（原对整段正文匹配＝漏拦）、WRITE_TOOLS 补 memory_conflict、
+ *      拦截决策改合法的 {kind:'deny'}（原 'block' 不在 PreToolDecision 联合类型内）
+ *
  * v0.2.0（2026-10-14，dsh 0.2 适配 + resource 并入）：
  *   1. 删除 `export const Config = null`（Config 不导出才安全，null 会崩设置页）
  *   2. 并入 resource 工具（自 dsh-resource 迁入，工具名不变）：scripts/resource.py 同包携带，
@@ -20,8 +30,8 @@
  * 实现：host 侧执行，Python 脚本承载算法（rrf_recall.py / vault.py / harvest.py）
  */
 import { mkdirSync, existsSync, appendFileSync, readFileSync, writeFileSync, renameSync, rmSync, statSync, readdirSync } from 'node:fs'
-import { createHash } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { execFileSync, spawn } from 'node:child_process'
 import { resolve, join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -47,12 +57,45 @@ const SENSITIVE_PATTERNS = [
 // 豁免路径（凭据类，允许明文）
 const EXEMPT_PATH = /(\.env|credentials|\.vault-key|VAULT\.md\.enc|\.git\/)/i
 // 写类工具（guard 扫描对象；bash 太噪，不扫）
-const WRITE_TOOLS = new Set(['write', 'edit', 'memory_suggest', 'memory_vault_set'])
+// v0.2.1：补 memory_conflict（merge/replace 会把 agent 原文写进 L1，原集合漏扫）
+const WRITE_TOOLS = new Set(['write', 'edit', 'memory_suggest', 'memory_vault_set', 'memory_conflict'])
 // primer 门控：实体/主题关键词（命中才召回注入；默认零注入）
 const PRIMER_GATE = [
   '记忆', '记住', '忘了', '偏好', '人物', '档案', '端口', '配置', '会议纪要',
   'A股', '控制论', 'Honcho', 'ZeroTier', '飞书', 'Vaultwarden', '老郑', '句号',
 ]
+
+/**
+ * 注入 user 消息的稳健工厂（v0.2.1）
+ *
+ * 优先用宿主 `@deepseek-ai/dsh-llm` 的 createUserMessage。但该裸导入在插件**真实目录**下
+ * 可能解析不到（本机实测 ERR_MODULE_NOT_FOUND：/home/boom/dsh-plugins/node_modules/@deepseek-ai/
+ * 只有 dsh-tools；Node 按 realpath 向上查找，profile 那层的 dsh-llm 用不到），
+ * 原实现把它放在 try 里静默吞掉 ⇒ primer/guard 整条注入链路恒失效。
+ * 故：解析失败时按宿主 createMessage 的等价形态兜底（role/content/source/id + 冻结），
+ * 保证注入不因依赖缺失而整条死掉；同时一次性 console.warn 留痕。
+ */
+let _createUserMessage = null // null=未探测 / function=宿主工厂 / false=不可用
+let _injectFactoryWarned = false
+async function makeInjectedUserMessage({ text, kind }) {
+  const content = [{ type: 'text', text }]
+  if (_createUserMessage === null) {
+    try {
+      const mod = await import('@deepseek-ai/dsh-llm')
+      _createUserMessage = typeof mod?.createUserMessage === 'function' ? mod.createUserMessage : false
+    } catch {
+      _createUserMessage = false
+    }
+  }
+  if (typeof _createUserMessage === 'function') {
+    return _createUserMessage({ content, source: { kind } })
+  }
+  if (!_injectFactoryWarned) {
+    _injectFactoryWarned = true
+    console.warn('[dsh-memory] @deepseek-ai/dsh-llm 不可解析，注入消息走等价兜底形态（建议补 node_modules/@deepseek-ai/dsh-llm 软链）')
+  }
+  return Object.freeze({ id: randomUUID(), role: 'user', content, source: { kind } })
+}
 
 /** 从消息 content（字符串或块数组）提取纯文本 */
 function extractText(content) {
@@ -638,12 +681,18 @@ export function apply(ctx, config = {}) {
       ctx.on('tools/pre-execute', (exec, next) => {
         const toolName = exec?.tool?.name || exec?.name
         if (!toolName || !WRITE_TOOLS.has(toolName)) return next()
-        const argsText = JSON.stringify(exec?.arguments ?? exec?.args ?? {})
-        if (EXEMPT_PATH.test(argsText)) return next()
+        const args = exec?.arguments ?? exec?.args ?? {}
+        const argsText = JSON.stringify(args)
+        // v0.2.1：豁免只判「目标路径」字段——原实现对整段 arguments（含即将写入的正文）匹配，
+        // 正文里出现 .env / credentials / .git/ 字样即整体跳过扫描（漏拦）。
+        const targetPath = String(args.file_path || args.path || args.ref || '')
+        if (EXEMPT_PATH.test(targetPath)) return next()
         const hit = SENSITIVE_PATTERNS.find((p) => p.re.test(argsText))
         if (hit) {
           if (guardBlock) {
-            return { kind: 'block', reason: `[memory-guard] 检测到敏感内容（${hit.label}），已拦截。请存入加密库（memory_vault_set）或只写引用路径。` }
+            // 合法决策是 {kind:'deny'|...}（PreToolDecision）；原写的 'block' 不在联合类型内，
+            // 只是被宿主"非 allow 且带 reason 即当拒绝"的兜底逻辑接受，属巧合可用。
+            return { kind: 'deny', reason: `[memory-guard] 检测到敏感内容（${hit.label}），已拦截。请存入加密库（memory_vault_set）或只写引用路径。` }
           }
           state.pendingWarns.push(`[memory-guard] 检测到 ${hit.label} 写入，遵守"只存引用路径不存原文"：敏感内容请走 memory_vault_set，明文只留 → vault:<ref>。`)
         }
@@ -689,23 +738,47 @@ export function apply(ctx, config = {}) {
           }
           if (parts.length === 0) return decision
           try {
-            const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-            const msg = createUserMessage({
-              content: [{ type: 'text', text: parts.join('\n\n') }],
-              source: { kind: 'plugin:dsh-memory' },
+            const msg = await makeInjectedUserMessage({
+              text: parts.join('\n\n'),
+              kind: 'plugin:dsh-memory',
             })
             return { ...decision, messages: [...decision.messages, msg] }
-          } catch { return decision }
+          } catch (e) {
+            // v0.2.1：注入失败整批回队（原实现 pendingWarns 已在上面清空 → 警告丢失且无重试），
+            // 并留痕，避免"静默失效"再次发生。
+            state.pendingWarns.unshift(...warns)
+            console.warn(`[dsh-memory] primer 注入失败（已回队 ${warns.length} 条）: ${String(e?.message || e)}`)
+            return decision
+          }
         })
       } catch { /* pre-step 不可用则跳过 */ }
     }
 
-    // ---------- 8. 钩子：harvest（turn/end 转录；不可用则由 automation 兜底） ----------
+    // ---------- 8. 钩子：harvest（会话转录；不可用则由 automation 兜底） ----------
+    // v0.2.1：事件名修正——dsh 0.2 里 `turn/end` 只是**会话事件类型**（`session.append("turn/end")`），
+    // 不是 Cordis 插件事件，`ctx.on('turn/end')` 永不触发。实据：`~/.dsh/memories/` 下从无
+    // index.sqlite / harvest-state.json / corrections.jsonl，而 20 份会话日志都在（L2 通道恒空）。
+    // 插件侧正确入口是 `session/event`（@mode emit，签名 `(session, event)`）。
+    // 另：harvest 是重活（全量解析会话 zstd），改为**非阻塞 spawn + 每 10 分钟最多一次**，
+    // 避免每个 turn 结束都同步阻塞主循环 30s。
     try {
-      ctx.on('turn/end', () => {
-        py('harvest.py', ['index'])
+      let lastHarvestAt = 0
+      ctx.on('session/event', (_session, event) => {
+        if (event?.type !== 'turn/end') return
+        const now = Date.now()
+        if (now - lastHarvestAt < 10 * 60 * 1000) return
+        lastHarvestAt = now
+        try {
+          const child = spawn(PYTHON, [join(scriptsDir, 'harvest.py'), 'index'], {
+            detached: true,
+            stdio: 'ignore',
+            env: PY_ENV,
+          })
+          child.on('error', () => { /* spawn 失败：交给 automation 兜底 */ })
+          child.unref()
+        } catch { /* 交给 automation 兜底 */ }
       })
-    } catch { /* turn/end 不可用：memory-harvest automation 兜底 */ }
+    } catch { /* session/event 不可用：memory-harvest automation 兜底 */ }
   }
 
   return { memoryDir }

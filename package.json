@@ -1,10 +1,10 @@
 {
   "name": "dsh-memory",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "index.js",
-  "description": "DSH 专属记忆插件：RRF 四路召回 / 确认制写入 / Fernet 加密库 / 会话转录 / 维护工具（HMS 架构移植）。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source、fileURLToPath 路径、exec.arguments ?? exec.args）；并入 resource 工具（自 dsh-resource，scripts/resource.py 同包携带）；Python 子进程走 config.python + UTF-8 env。",
+  "description": "DSH 专属记忆插件：RRF 四路召回 / 确认制写入 / Fernet 加密库 / 会话转录 / 维护工具（HMS 架构移植）。v0.2.0：适配 dsh 0.2（Config 不导出、pre-step 注入 v4 source、fileURLToPath 路径、exec.arguments ?? exec.args）；并入 resource 工具（scripts/resource.py 同包携带）；Python 子进程走 config.python + UTF-8 env。v0.2.1：转录钩子 turn/end→session/event（事件名不存在致 L2 从未运行）、primer 注入兜底+失败回队、memory_zero_hit 切分口径对齐 rrf_recall、resource person 分支防路径穿越、rrf 预算耗尽不再截成 1 字符、guard 豁免只判路径且补 memory_conflict 与 deny 语义。",
   "dependencies": {},
   "peerDependencies": {
     "@deepseek-ai/dsh": "*",

@@ -21,15 +21,21 @@ L1_FILES = [("MEMORY.md", MEMORIES / "MEMORY.md"), ("USER.md", MEMORIES / "USER.
 
 
 def parse_l1_entries(path: Path):
-    """把 L1 文件按 § 拆成条目，返回 [{file, head40, text, tags}]"""
+    """把 L1 文件按 § 拆成条目，返回 [{file, head40, text, tags}]
+
+    v0.2.1：切分口径与 rrf_recall.split_entries 对齐（`split("§")` + strip）。
+    原实现用 `split("\\n§\\n")` 会保留前导 "§ "，而 usage key 由
+    rrf_recall._record_usage 用 `ent["text"][:40]`（无 § 前缀）写入 ⇒ 两键永不相等，
+    本工具对**所有**条目恒报「零命中（从未召回）」（实测同一实录 .usage.json 记
+    uses=8、本工具报 uses=0），会误导周审归档/淘汰仍在用的规则。
+    """
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     entries = []
-    for chunk in text.split("\n§\n"):
+    for chunk in text.split("§"):
         chunk = chunk.strip()
         if not chunk:
             continue
-        # head40 = 条目原文前 40 字符（含标签前缀，与 rrf_recall._record_usage 的 key 对应）
-        # usage key 形如 'MEMORY.md:#工作流 #验证 当 Obsidian...'（前 40 字符）
+        # head40 = 条目原文前 40 字符，与 rrf_recall._record_usage 的 key 同源
         head = chunk[:40]
         tags = re.findall(r"#([^\s#]+)", chunk)
         entries.append({"file": path.name, "head40": head, "text": chunk, "tags": tags})

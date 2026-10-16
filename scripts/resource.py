@@ -155,8 +155,12 @@ def mem_read(path):
         out = [f"mem://person/{name}"]
         graph = run_py(GRAPH_QUERY, [name, "--min-w", "0"])
         out.append(graph or "（图谱无沿边）")
-        ep = os.path.join(WIKI_ROOT, "entities", f"{name}.md")
-        if os.path.exists(ep):
+        # v0.2.1：原 `os.path.join(WIKI_ROOT, "entities", f"{name}.md")` 未走 safe_resolve，
+        # 实测 `mem://person/../../../../.dsh/memories/MEMORY` 可读出 vault 外任意 *.md 全文
+        # （穿越）。改为经 safe_resolve 收敛在 wiki/entities 内，与其余 ref 分支口径一致。
+        ep = (safe_resolve(os.path.join(WIKI_ROOT, "entities"), f"{name}.md")
+              if name and "/" not in name and "\\" not in name else None)
+        if ep and os.path.exists(ep):
             try:
                 body = re.sub(r"^---.*?---", "", open(ep, encoding="utf-8").read(), flags=re.S).strip()
                 out.append(f"\nentities/{name}.md 摘要：\n{body[:MAX_READ_CHARS]}")

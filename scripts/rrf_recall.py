@@ -925,11 +925,18 @@ def main() -> None:
 
     results = []
     used = 0
+    truncated = 0
     for key, score, meta in fused[: args.topk]:
         text = meta["text"]
         lane_name = ["L1", "L2", "L3", "L4", "L5", "L6"][meta["lane"]]
         trust = {"L1": "高", "L2": "中", "L3": "低", "L4": "中", "L5": "高", "L6": "中"}[lane_name]
-        snippet = text[: max(1, args.budget - used)]
+        # v0.2.1：原 `text[: max(1, args.budget - used)]` 在预算耗尽后把每条截成 **1 个字符**
+        # （实测 budget=600 时 #3/#4/#5 输出 '['），且总量必然超预算。改为耗尽即停止展开并计数。
+        remaining = args.budget - used
+        if remaining <= 0:
+            truncated = len(fused[: args.topk]) - len(results)
+            break
+        snippet = text[:remaining]
         used += len(snippet)
         results.append({"source": lane_name, "score": score, "trust": trust, "text": snippet})
 
@@ -938,10 +945,13 @@ def main() -> None:
 
     if args.json:
         print(json.dumps({"query": args.query, "entities": sorted(q_entities),
-                          "date": date.isoformat() if date else None, "results": results}, ensure_ascii=False))
+                          "date": date.isoformat() if date else None,
+                          "truncated": truncated, "results": results}, ensure_ascii=False))
         return
 
     print(f"# 召回: {args.query}  实体: {sorted(q_entities)}  时间窗: {date.isoformat() if date else '—'}")
+    if truncated:
+        print(f"（预算 {args.budget} 已用尽：另有 {truncated} 条命中未展开，可提高 --budget）")
     if not results:
         print("（无命中）")
         return

@@ -27,7 +27,7 @@ HONCHO_BASE = "http://127.0.0.1:8000"
 # 原因：桥（L3 唯一读取入口）的口径是 hermes 工作区的 hermes→laozheng，写进 dsh 工作区的内容
 # L3 永远看不到。现写 hermes/dsh-agent→laozheng，桥侧以 HONCHO_EXTRA_OBSERVERS=dsh-agent 并查，
 # 既保住来源标识（observer=dsh-agent，与 dsh 工作区 370 条历史同身份）又能被召回。
-WS = "hermes"
+WS = "life"
 OBSERVER = "dsh-agent"
 OBSERVED = "laozheng"
 STATE_FILE = Path.home() / ".dsh" / "memories" / "honcho-sync-state.json"
