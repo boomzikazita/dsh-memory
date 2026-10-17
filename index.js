@@ -1,6 +1,12 @@
 /**
  * dsh-memory — DSH 专属记忆插件（HMS 架构 → DSH 实现）
  *
+ * v0.2.3（2026-10-17，修归属门绕过漏洞）：
+ *   v0.2.2 的归属门写成 `track === 'memory'`，实测被绕过——模型把持仓方案当「人物画像」
+ *   改用 track=user 落地（证据：session-e1e018f2，17:40，USER.md 第 12 条 170 字含持仓/本金/佣金）。
+ *   修法：凡落 L1 的通道（memory / user）一律同口径拦；skill 落 SKILL.md 不占 L1，不拦。
+ *   教训：归属门不能只挂在「一个入口」上——**只要有第二个写入通道，闸门就等于没装**。
+ *
  * v0.2.2（2026-10-17，四库严格划分 → 入口收口）：
  *   1. memory_suggest 归属门（track=memory）：lifecycle=record 与档案类内容（定稿/方案/批次/持仓/本金…）
  *      **硬拒**并指路 wiki；纪律类（一律/禁止/不得/必须先/红线）且 >300 字给软提示——纪律应常驻 AGENTS.md，
@@ -70,7 +76,8 @@ const WRITE_TOOLS = new Set(['write', 'edit', 'memory_suggest', 'memory_vault_se
 // 归属门（2026-10-17 四库严格划分）：L1 只收「触发式知识」，其余三类各有归处——
 // SOUL=人格红线 / AGENTS=常驻纪律与系统事实 / USER=人物画像 / MEMORY=if-then 知识 / wiki=项目记录。
 // 硬拦只认两类无歧义特征（档案、record），纪律类给软提示：纪律要每轮生效、召回会漏。
-const ROUTE_ARCHIVE = /(已定稿|定稿|配置方案|投资方案|施工单|施工记录|第\s*\d+\s*批|\d+\s*批[季月]投|持仓|本金|佣金|条件单|全文\s*`|全文见)/
+// 0.2.3 收紧：去掉裸「定稿」——它误伤合法画像「迭代类文稿要双版本：clean 定稿 + 修订标记版」（USER.md 输出条实测）。
+const ROUTE_ARCHIVE = /(已定稿|配置方案|投资方案|施工单|施工记录|第\s*\d+\s*批|\d+\s*批[季月]投|持仓|本金|佣金|条件单|全文\s*`|全文见)/
 const ROUTE_DISCIPLINE = /(一律|禁止|不得|必须先|红线)/
 const ROUTE_HINT = {
   archive: '项目方案/档案 → wiki（原文落库，L1 最多留一行指针）',
@@ -334,14 +341,16 @@ export function apply(ctx, config = {}) {
         if (days < 30 || days > 365) return `[memory_suggest] expiresDays 应在 30-365（情境类生命周期）`
         expires = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10)
       }
-      // 归属门（2026-10-17）：record 与档案类硬拦——两类都是「记忆层最容易被灌的东西」。
-      // 只对 track=memory 生效：user/skill 写的是画像与技能，不适用本口径。
+      // 归属门（2026-10-17 立，0.2.3 修绕过漏洞）：record 与档案类硬拦——两类都是「记忆层最容易被灌的东西」。
+      // v0.2.2 曾限定 `track === 'memory'`，实测被绕过：模型把持仓方案当「人物画像」走 track=user 落地
+      // （session-e1e018f2，2026-10-17 17:40）。凡落 L1 的通道（memory/user）一律同口径；skill 落 SKILL.md 不占 L1，不拦。
       const rawContent = input.content ?? ''
-      if (track === 'memory' && lifecycle === 'record') {
+      const L1_TRACK = track !== 'skill'
+      if (L1_TRACK && lifecycle === 'record') {
         return `[memory_suggest] 拒收：lifecycle=record 是一次性记录，按四库划分归 wiki，不进 L1（${ROUTE_HINT.archive}）。确为可复用知识时改写为 if-then、lifecycle=stable。`
       }
-      if (track === 'memory' && ROUTE_ARCHIVE.test(rawContent)) {
-        return `[memory_suggest] 拒收：内容含档案特征（定稿/方案/批次/持仓等），按四库划分归 wiki（${ROUTE_HINT.archive}）。L1 只收「触发才用」的 if-then 知识。`
+      if (L1_TRACK && ROUTE_ARCHIVE.test(rawContent)) {
+        return `[memory_suggest] 拒收（track=${track}）：内容含档案特征（定稿/方案/批次/持仓/本金/佣金等），按四库划分归 wiki（${ROUTE_HINT.archive}）。四库都不收项目档案；人物画像只放稳定偏好，不放持仓明细。`
       }
       // trigger 保障（2026-08-19）：无 trigger 的提案自动提炼补充，确保落盘条目必有触发词
       const content = ensureTrigger(input.content ?? '')
