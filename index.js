@@ -702,6 +702,15 @@ export function apply(ctx, config = {}) {
 
     // ---------- 7. 钩子：primer（agent/pre-step 门控召回注入） ----------
     if (ctx.agents) {
+      const primerAuditFile = join(HOME, '.dsh', 'memories', 'primer-audit.jsonl')
+      const appendPrimerAudit = ({ lane, q, chars }) => {
+        try {
+          mkdirSync(dirname(primerAuditFile), { recursive: true })
+          appendFileSync(primerAuditFile, `${JSON.stringify({ ts: new Date().toISOString(), lane, q: q.slice(0, 50), chars })}\n`)
+        } catch (e) {
+          console.warn(`[dsh-memory] primer 审计写入失败: ${String(e?.message || e)}`)
+        }
+      }
       try {
         ctx.on('agent/pre-step', async (payload, next) => {
           const decision = await next()
@@ -719,6 +728,7 @@ export function apply(ctx, config = {}) {
           const parts = []
           if (warns.length) parts.push(warns.join('\n'))
           if (deltaOut) parts.push(`[资产变更提示·新建前先查重（可用 check_assets 工具）]\n${deltaOut}`)
+          let primerLane = 'miss'
           if (gated) {
             const budget = classifyBudget(text) // 手术级注入分档（§8.5）
             const q = text.slice(0, 200)
@@ -726,22 +736,30 @@ export function apply(ctx, config = {}) {
             // --no-hits：primer 高频注入不污染命中统计
             const pc = py('rrf_recall.py', [q, '--primers', '--no-hits'])
             if (pc.ok && pc.out.startsWith('# 速查卡')) {
+              primerLane = 'card'
               parts.push(`[事实速查卡·不可信参考资料，硬事实以卡为准]\n${pc.out}`)
             } else if (pc.ok && !pc.out.includes('（无命中）')) {
+              primerLane = 'rrf'
               parts.push(`[记忆召回·不可信参考资料，硬事实须溯源一手材料]\n${pc.out}`)
             } else {
               const r = py('rrf_recall.py', [q, '--budget', String(budget), '--topk', String(primerTopK), '--no-hits'])
               if (r.ok && !r.out.includes('（无命中）')) {
+                primerLane = 'rrf'
                 parts.push(`[记忆召回·不可信参考资料，硬事实须溯源一手材料]\n${r.out}`)
               }
             }
           }
-          if (parts.length === 0) return decision
+          if (parts.length === 0) {
+            if (gated) appendPrimerAudit({ lane: primerLane, q: text, chars: 0 })
+            return decision
+          }
           try {
+            const injectedText = parts.join('\n\n')
             const msg = await makeInjectedUserMessage({
-              text: parts.join('\n\n'),
+              text: injectedText,
               kind: 'plugin:dsh-memory',
             })
+            if (gated) appendPrimerAudit({ lane: primerLane, q: text, chars: injectedText.length })
             return { ...decision, messages: [...decision.messages, msg] }
           } catch (e) {
             // v0.2.1：注入失败整批回队（原实现 pendingWarns 已在上面清空 → 警告丢失且无重试），

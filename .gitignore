@@ -4,3 +4,7 @@ node_modules/
 *.pem
 *.key
 credentials*
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
