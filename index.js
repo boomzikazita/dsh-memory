@@ -1,6 +1,14 @@
 /**
  * dsh-memory — DSH 专属记忆插件（HMS 架构 → DSH 实现）
  *
+ * v0.2.2（2026-10-17，四库严格划分 → 入口收口）：
+ *   1. memory_suggest 归属门（track=memory）：lifecycle=record 与档案类内容（定稿/方案/批次/持仓/本金…）
+ *      **硬拒**并指路 wiki；纪律类（一律/禁止/不得/必须先/红线）且 >300 字给软提示——纪律应常驻 AGENTS.md，
+ *      L1 靠关键词召回，漏命中即失效。背景：审计发现 L1 里 9/10 条是纪律、排查长文、项目方案，
+ *      只有 1 条真属 if-then 知识；根因是插件只给 memory/user/skill 三个落点，AGENTS.md 无通道。
+ *   2. memory_health 增常驻层体检：调 scripts/layer_audit.py 报 SOUL/全局与工作区 AGENTS 字数、
+ *      跨文件重复段、`§` 空条目、.usage.json 陈旧键（常驻层每轮付 token，比 L1 预算更贵）
+ *
  * v0.2.1（2026-10-15，修 6 处运行期缺陷）：
  *   1. 转录钩子 `ctx.on('turn/end')` 事件名不存在（turn/end 只是会话事件类型）⇒ L2 从未运行
  *      → 改 `session/event`（emit，(session,event)）+ 非阻塞 spawn + 每 10 分钟节流
@@ -59,6 +67,15 @@ const EXEMPT_PATH = /(\.env|credentials|\.vault-key|VAULT\.md\.enc|\.git\/)/i
 // 写类工具（guard 扫描对象；bash 太噪，不扫）
 // v0.2.1：补 memory_conflict（merge/replace 会把 agent 原文写进 L1，原集合漏扫）
 const WRITE_TOOLS = new Set(['write', 'edit', 'memory_suggest', 'memory_vault_set', 'memory_conflict'])
+// 归属门（2026-10-17 四库严格划分）：L1 只收「触发式知识」，其余三类各有归处——
+// SOUL=人格红线 / AGENTS=常驻纪律与系统事实 / USER=人物画像 / MEMORY=if-then 知识 / wiki=项目记录。
+// 硬拦只认两类无歧义特征（档案、record），纪律类给软提示：纪律要每轮生效、召回会漏。
+const ROUTE_ARCHIVE = /(已定稿|定稿|配置方案|投资方案|施工单|施工记录|第\s*\d+\s*批|\d+\s*批[季月]投|持仓|本金|佣金|条件单|全文\s*`|全文见)/
+const ROUTE_DISCIPLINE = /(一律|禁止|不得|必须先|红线)/
+const ROUTE_HINT = {
+  archive: '项目方案/档案 → wiki（原文落库，L1 最多留一行指针）',
+  discipline: '常驻纪律 → ~/.dsh/AGENTS.md（每轮注入；L1 靠关键词召回，漏命中即失效）',
+}
 // primer 门控：实体/主题关键词（命中才召回注入；默认零注入）
 const PRIMER_GATE = [
   '记忆', '记住', '忘了', '偏好', '人物', '档案', '端口', '配置', '会议纪要',
@@ -294,7 +311,7 @@ export function apply(ctx, config = {}) {
   // ---------- 2. 工具：memory_suggest（确认制写入提案） ----------
   ctx.tools.register(defineTool({
     name: 'memory_suggest',
-    description: '提交记忆写入提案（进待确认队列，不直接写）。track: memory=全局规则/USER=用户档案/skill=技能草案。lifecycle: rule=常驻/stable=稳定/situational=情境（自动带 expires 默认90天）/record=一次性记录（不进 L1 归 wiki）。敏感内容用 memory_vault_set',
+    description: '提交记忆写入提案（进待确认队列，不直接写）。track: memory=全局规则/USER=用户档案/skill=技能草案。lifecycle: rule=常驻/stable=稳定/situational=情境（自动带 expires 默认90天）/record=一次性记录（不进 L1 归 wiki）。四库划分：人格红线→SOUL｜纪律与系统事实→AGENTS.md｜人物画像→track=user｜触发式 if-then→memory｜项目记录→wiki（record 与档案类会被拒收）。敏感内容用 memory_vault_set',
     parameters: {
       content: { type: 'string', required: true, description: '提案内容（§ 格式条目或技能草案）' },
       track: { type: 'string', description: 'memory / user / skill，默认 memory' },
@@ -316,6 +333,15 @@ export function apply(ctx, config = {}) {
         const days = Number(input?.expiresDays) || 90
         if (days < 30 || days > 365) return `[memory_suggest] expiresDays 应在 30-365（情境类生命周期）`
         expires = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10)
+      }
+      // 归属门（2026-10-17）：record 与档案类硬拦——两类都是「记忆层最容易被灌的东西」。
+      // 只对 track=memory 生效：user/skill 写的是画像与技能，不适用本口径。
+      const rawContent = input.content ?? ''
+      if (track === 'memory' && lifecycle === 'record') {
+        return `[memory_suggest] 拒收：lifecycle=record 是一次性记录，按四库划分归 wiki，不进 L1（${ROUTE_HINT.archive}）。确为可复用知识时改写为 if-then、lifecycle=stable。`
+      }
+      if (track === 'memory' && ROUTE_ARCHIVE.test(rawContent)) {
+        return `[memory_suggest] 拒收：内容含档案特征（定稿/方案/批次/持仓等），按四库划分归 wiki（${ROUTE_HINT.archive}）。L1 只收「触发才用」的 if-then 知识。`
       }
       // trigger 保障（2026-08-19）：无 trigger 的提案自动提炼补充，确保落盘条目必有触发词
       const content = ensureTrigger(input.content ?? '')
@@ -359,7 +385,9 @@ export function apply(ctx, config = {}) {
         const parts = overlaps.map((o) => `${o.kind}[${o.overlap}%${o.tags ? `,标签${o.tags}` : ''}]「${o.head}…」`)
         warn = ` ⚠️ 与既有记忆重叠：${parts.join('；')}。建议采纳时合并/更新既有条目而非新增（可调 memory_conflict detect 看批量候选、merge 执行合并；L1 预算 ${current + extra}/${budget}）。`
       }
-      if (lifecycle === 'record') warn += '（提示：record=完成记录，按治理规则应归 wiki 而非 L1，weekly-review 会提归档）'
+      if (track === 'memory' && ROUTE_DISCIPLINE.test(content) && content.length > 300) {
+        warn += '（提示：含纪律措辞且偏长——纪律按四库划分应进 AGENTS.md 常驻，L1 靠关键词召回，漏命中即失效）'
+      }
       if (lifecycle === 'situational') warn += `（情境类，expires=${expires}，到期 weekly-review 提归档）`
       // 2026-10-14：条数口径与 memory_health 对齐——只数 pending（原先数全量行，含已 rejected，显得像积压）
       const pendingCount = suggestions.filter((s) => s.status === 'pending').length
@@ -541,6 +569,9 @@ export function apply(ctx, config = {}) {
         lines.push(`${f}: ${c}/${b} (${Math.round((c / b) * 100)}%)${c > b ? ' ⚠超预算' : ''}`)
       }
       lines.push(`vault: ${py('vault.py', ['check']).ok ? 'OK' : '异常'}`)
+      // 常驻层体检（2026-10-17）：SOUL/AGENTS 每轮必付 token，比 L1 预算更贵，必须一起看
+      const la = py('layer_audit.py', [])
+      if (la.ok && la.out) lines.push(la.out)
       lines.push(`L2 索引: ${existsSync(file('index.sqlite')) ? '存在' : '未建立（跑 memory_harvest）'}`)
       const sug = loadSuggestions().filter((s) => s.status === 'pending')
       lines.push(`待确认队列: ${sug.length} 条`)
